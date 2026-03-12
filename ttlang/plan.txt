@@ -1,0 +1,283 @@
+Nanochat d32 Inference on Tenstorrent Hardware via TT-Lang
+==========================================================
+
+Goal: Run full autoregressive inference of the nanochat d32 GPT model
+(32 layers, 2048 embd, 16 heads, head_dim=128, vocab=32768, MLP=8192)
+with as much compute as possible in TT-Lang kernels.
+
+Model: nanochat/gpt.py (GPTConfig, GPT, Block, CausalSelfAttention, MLP)
+Checkpoint: d32 checkpoint (to be provided)
+Tokenizer: nanochat/tokenizer.py (BPE, vocab_size=32768)
+
+================================================================================
+PART 1: KERNEL STATUS
+================================================================================
+
+Kernels written and passing in sim (all in ttlang/):
+
+  test_rmsnorm.py    - RMSNorm, grid="auto", streaming (1,1) tiles
+                       Also passes on HW. Max error 0.19 (bf16 acceptable).
+
+  test_linear.py     - Linear projection (out = x @ w), grid="auto"
+                       Multi-tile DFB for K accumulation in DST.
+                       Tested up to (32,2048)@(2048,8192). Max error 4.0.
+
+  test_mlp.py        - Full MLP pipeline: linear -> relu^2 -> linear
+                       Tested at d32 size (2048->8192->2048). Max error 0.045.
+                       Also contains standalone relu_sq_kernel.
+
+  test_rotary.py     - Rotary position embeddings, grid="auto"
+                       Per-head (seq, head_dim=128). Max error 0.031.
+
+  test_residual.py   - residual_add_kernel: out = x + y
+                       scaled_residual_kernel: out = lr*x + l0*x0
+                       softcap_kernel: out = cap * tanh(x / cap)
+                       All pass in sim. Max errors < 0.07.
+
+  test_sdpa.py       - Scaled dot-product attention
+                       Passes for single-tile seq (32 tokens, PCC 0.9999).
+                       Blocked on multi-tile by two bugs (see below).
+
+================================================================================
+PART 2: BLOCKING BUGS
+================================================================================
+
+Bug 1: Non-square matmul on HW (GH issue #383)
+  - Shapes like (1,4)@(4,1) fail with "shape mismatch" on HW compiler.
+  - Sim handles correctly. All multi-tile matmul kernels pass in sim.
+  - Blocks: linear_kernel on HW, SDPA on HW.
+  - Fix: pending from Zach.
+
+Bug 2: Multi-tile reduce/broadcast shape in sim
+  - reduce_max/reduce_sum on multi-tile DFBs (e.g., (1,2) tiles) fails
+    with "Length mismatch in store()" in sim.
+  - Blocks: SDPA for cache_len > 32 tokens in sim.
+  - Dim semantics confusion (issue #375) may be related.
+  - Untestable on HW due to Bug 1 blocking earlier in the pipeline.
+
+Once both bugs are fixed, the SDPA kernel should work for arbitrary cache
+lengths since the algorithm is correct (proven by single-tile PCC 0.9999).
+
+================================================================================
+PART 3: VALIDATION STEPS ONCE FIXES LAND
+================================================================================
+
+Step 1: Verify non-square matmul on HW
+  ~/.claude/commands/tools/run-test.sh --hw ttlang/test_matmul.py
+  Expected: all 3 tests pass (32x32, 32x64, 32x2048 matmuls).
+
+Step 2: Verify linear projection on HW
+  ~/.claude/commands/tools/run-test.sh --hw ttlang/test_linear.py
+  Expected: all 3 tests pass (small, Q/K/V size, MLP fc size).
+
+Step 3: Verify full MLP on HW
+  ~/.claude/commands/tools/run-test.sh --hw ttlang/test_mlp.py
+  Expected: relu^2 exact, small MLP < 0.001, d32 MLP < 0.1.
+
+Step 4: Verify multi-tile SDPA in sim
+  ~/.claude/commands/tools/run-test.sh ttlang/test_sdpa.py
+  Expected: test 2 (Q=32, KV=64) and test 3 (Q=32, KV=128) pass with PCC > 0.99.
+
+Step 5: Verify SDPA on HW
+  ~/.claude/commands/tools/run-test.sh --hw ttlang/test_sdpa.py
+  Expected: all tests pass.
+
+Step 6: Run all kernels on HW
+  for f in ttlang/test_*.py; do
+    ~/.claude/commands/tools/run-test.sh --hw "$f"
+  done
+
+================================================================================
+PART 4: PERFORMANCE OPTIMIZATIONS (priority order)
+================================================================================
+
+Opt 1: SDPA multicore - one head per core [HUGE WIN]
+  Current: single core, all 16 heads serialized.
+  Fix: grid=(16, 1), each core handles one head.
+  Heads are independent - no pipes needed.
+  ~16x speedup for attention.
+
+Opt 2: Linear kernel - load x once per core [EASY WIN]
+  Current: x re-read from DRAM for every output column.
+  Fix: x_dfb buffer_factor=1, load once in dm_read before column loop.
+  Compute holds x in scope: with x_dfb.wait() as xv: <column loop>.
+  Saves ~64 DRAM reads per projection (8MB saved per 2048x2048 matmul).
+
+Opt 3: Fused MLP kernel [MEDIUM WIN]
+  Current: 3 kernel launches (linear -> relu^2 -> linear), 3 DRAM round-trips.
+  Fix: single kernel with intermediate DFBs in L1.
+  Pattern: stream w_fc columns, apply relu^2 in compute, stream w_proj rows,
+  accumulate output. Hidden activation (8192-wide) never touches DRAM.
+  Saves writing+reading 8192-wide hidden tensor (256KB per token).
+
+Opt 4: Fuse residual + norm [SMALL WIN]
+  Current: residual_add writes to DRAM, rmsnorm reads it back.
+  Fix: single kernel that computes (lr*x + l0*x0), then normalizes in-place.
+  Two-pass read of the fused result (sum-of-squares, then normalize).
+  Saves one DRAM round-trip per layer (x2 for attn+mlp = 64 saves for d32).
+
+Opt 5: Fuse norm + linear [SMALL WIN]
+  Current: norm writes normalized x to DRAM, linear reads it.
+  Fix: norm output feeds directly into matmul via intermediate DFB.
+  Complex because norm is streaming (1,1) tiles but linear needs full x row.
+  May need norm to write to L1 buffer that linear reads.
+
+================================================================================
+PART 5: WIRING INFERENCE (host-side, no TT-Lang needed)
+================================================================================
+
+File: ttlang/inference.py
+
+Step A: Weight preparation (one-time)
+  - Load d32 checkpoint: model_<step>.pt
+  - Reshape all weight matrices to 2D tile-aligned tensors:
+      wte.weight: (32768, 2048) -> ttnn DRAM tensor
+      lm_head.weight: (32768, 2048) -> ttnn DRAM tensor (transposed for matmul)
+      Per layer (x32):
+        attn.c_q.weight: (2048, 2048) -> ttnn DRAM
+        attn.c_k.weight: (2048, 2048) -> ttnn DRAM
+        attn.c_v.weight: (2048, 2048) -> ttnn DRAM
+        attn.c_proj.weight: (2048, 2048) -> ttnn DRAM
+        mlp.c_fc.weight: (8192, 2048) -> transpose -> (2048, 8192) ttnn DRAM
+        mlp.c_proj.weight: (2048, 8192) -> transpose -> (8192, 2048) ttnn DRAM
+      resid_lambdas: (32,) -> 32 scalar tile tensors
+      x0_lambdas: (32,) -> 32 scalar tile tensors
+      Value embedding weights: per-layer ttnn DRAM tensors
+  - Precompute rotary cos/sin for max_seq_len
+  - Precompute constant tiles: scaler (all 1s), mean_scale (1/2048)
+  - Precompute softcap tiles: inv_cap (1/15), cap (15)
+
+Step B: KV cache setup
+  - Allocate KV cache as ttnn DRAM tensors:
+      k_cache: (n_layers, n_kv_head, max_seq_len, head_dim) reshaped for tile access
+      v_cache: same
+  - Track cache position (host-side integer)
+  - For each new token, update cache via ttnn slice assignment or ttl.copy
+
+Step C: Single decode step (one token -> one token)
+  Input: token_id (int), cache_pos (int)
+
+  1. Embedding: x = wte[token_id]  (ttnn.embedding, returns (1, 2048) on device)
+     Pad to (32, 2048) for tile alignment.
+
+  2. Normalize: x = rmsnorm_kernel(x)
+
+  3. Save x0 = x for residual blending
+
+  4. For each layer i = 0..31:
+     a. Scaled residual: x = scaled_residual_kernel(x, x0, resid_lambda[i], x0_lambda[i])
+
+     b. Pre-attention norm: x_normed = rmsnorm_kernel(x)
+
+     c. Q/K/V projections:
+        q = linear_kernel(x_normed, w_q[i])   # (32, 2048)
+        k = linear_kernel(x_normed, w_k[i])   # (32, 2048)
+        v = linear_kernel(x_normed, w_v[i])   # (32, 2048)
+
+     d. Reshape for multi-head: split (32, 2048) into 16 heads of (32, 128)
+        (host-side view/slice, or restructure weight matrices)
+
+     e. Rotary embeddings per head:
+        For each head h:
+          q_h = rotary_kernel(q_head_h, cos[pos], sin[pos])
+          k_h = rotary_kernel(k_head_h, cos[pos], sin[pos])
+
+     f. QK norm per head: q_h = rmsnorm_kernel(q_h), k_h = rmsnorm_kernel(k_h)
+        Scale: q_h *= 1.15, k_h *= 1.15 (elementwise, can fuse with norm)
+
+     g. Update KV cache: write k_h, v_h to cache[i][h][pos]
+
+     h. Attention per head:
+        For each head h:
+          attn_out_h = sdpa_kernel(q_h, k_cache[i][h][:pos+1], v_cache[i][h][:pos+1])
+        (With multicore SDPA: all 16 heads in one kernel launch)
+
+     i. Concatenate heads: (16 heads of (32, 128)) -> (32, 2048)
+
+     j. Output projection: y = linear_kernel(attn_concat, w_proj[i])
+
+     k. Residual: x = residual_add_kernel(x, y)
+
+     l. Pre-MLP norm: x_normed = rmsnorm_kernel(x)
+
+     m. MLP: mlp_out = linear -> relu^2 -> linear
+        (or fused MLP kernel once implemented)
+
+     n. Residual: x = residual_add_kernel(x, mlp_out)
+
+  5. Final norm: x = rmsnorm_kernel(x)
+
+  6. LM head: logits = linear_kernel(x, w_lm_head)  # (32, 32768)
+
+  7. Softcap: logits = softcap_kernel(logits)
+
+  8. Read logits[0, :vocab_size] back to host (only row 0 has our token)
+
+  9. Sample next token (host-side top-k / temperature sampling)
+
+Step D: Generation loop
+  - Tokenize prompt
+  - Prefill: process all prompt tokens (can do sequentially at first)
+  - Decode: loop calling Step C, yielding tokens
+  - Detokenize and print
+
+Step E: Value embeddings (ResFormer)
+  - On alternating layers, look up value embedding for current token
+  - Apply gating: v = v + gate * ve
+  - Gate = 3 * sigmoid(ve_gate(x[:, :12]))
+  - Can implement gate as: linear_kernel (small 12->n_kv_head) + sigmoid + scale
+  - Or just use ttnn ops for this small computation
+
+================================================================================
+PART 6: TESTING MILESTONES
+================================================================================
+
+Milestone 1: Single layer forward pass
+  - Load one layer's weights
+  - Run one decode step through one transformer block
+  - Compare output against PyTorch reference (same weights, same input)
+  - Target: PCC > 0.99
+
+Milestone 2: Full model forward pass
+  - Load all 32 layers
+  - Run one decode step through entire model
+  - Compare logits against PyTorch reference
+  - Target: PCC > 0.98 (accumulated bf16 error across 32 layers)
+
+Milestone 3: Autoregressive generation
+  - Generate 64 tokens from a prompt
+  - Compare against PyTorch generation (temperature=0 for deterministic)
+  - Target: exact token match for first ~20 tokens, divergence ok after
+
+Milestone 4: Performance baseline
+  - Measure tokens/sec for decode
+  - Profile to identify actual bottlenecks
+  - Apply optimizations from Part 4
+
+================================================================================
+NOTES
+================================================================================
+
+- All weight matrices in nanochat are stored transposed (nn.Linear stores
+  weight as (out_features, in_features)). Need to transpose when loading
+  so that matmul is x @ w.T or pre-transpose to (in_features, out_features).
+
+- Nanochat uses no bias in any linear layer. Simplifies all projections.
+
+- RMSNorm has no learnable parameters. Just x / rms(x).
+
+- Per-layer scalars (resid_lambdas, x0_lambdas) are tiny - just fill tiles.
+
+- Sliding window attention pattern "SSSL" means some layers use shorter
+  context. For decode with KV cache this just means attending to fewer
+  cached tokens. Can implement by slicing the cache.
+
+- The 1.15 QK scaling factor can be baked into the SDPA scale tile:
+  scale = 1.15 * 1.15 / sqrt(head_dim) instead of separate multiply.
+
+- GQA: for d32, n_head == n_kv_head == 16, so no GQA complexity.
+  All heads have independent K/V.
+
+- For prefill (processing full prompt), we need causal masking in SDPA.
+  This is a future enhancement. Initial version can prefill token-by-token
+  (slow but correct).
