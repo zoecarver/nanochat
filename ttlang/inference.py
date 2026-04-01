@@ -66,7 +66,7 @@ def has_ve(layer_idx, n_layer):
 def make_rmsnorm_kernel(n_dim):
     dim_tiles = n_dim // TILE
 
-    @ttl.kernel(grid="auto")
+    @ttl.operation(grid="auto")
     def rmsnorm_kernel(x, scaler, mean_scale, out):
         grid_cols, _ = ttl.grid_size(dims=2)
         seq_tiles = x.shape[0] // TILE
@@ -84,7 +84,7 @@ def make_rmsnorm_kernel(n_dim):
 
         @ttl.compute()
         def compute():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             with sc_dfb.wait() as sc, ms_dfb.wait() as ms:
                 for local_t in range(tiles_per_core):
                     tile_idx = core_x * tiles_per_core + local_t
@@ -108,7 +108,7 @@ def make_rmsnorm_kernel(n_dim):
 
                         # broadcast, scale by 1/N, add eps, rsqrt
                         with acc_dfb.wait() as total, bcast_dfb.reserve() as bc:
-                            bc.store(ttl.math.broadcast(total, dims=[1]))
+                            bc.store(ttl.math.broadcast(total, bc, dims=[1]))
                         with bcast_dfb.wait() as bv, red_dfb.reserve() as scaled:
                             scaled.store(bv * ms + ttl.math.fill(bv, 1e-5))
                         with red_dfb.wait() as msq, rsq_dfb.reserve() as rsq:
@@ -122,7 +122,7 @@ def make_rmsnorm_kernel(n_dim):
 
         @ttl.datamovement()
         def dm_read():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             with sc_dfb.reserve() as blk:
                 tx = ttl.copy(scaler[0, 0], blk); tx.wait()
             with ms_dfb.reserve() as blk:
@@ -139,7 +139,7 @@ def make_rmsnorm_kernel(n_dim):
 
         @ttl.datamovement()
         def dm_write():
-            core_x, _ = ttl.core(dims=2)
+            core_x, _ = ttl.node(dims=2)
             for local_t in range(tiles_per_core):
                 tile_idx = core_x * tiles_per_core + local_t
                 if tile_idx < seq_tiles:
@@ -155,58 +155,74 @@ rmsnorm_head = make_rmsnorm_kernel(HEAD_DIM)
 
 
 # -- Linear projection: out = x @ w --
-# Uses multi-tile DFBs for K accumulation in DST. Caps K chunk size to fit L1.
-K_CHUNK_MAX = 64  # max tiles in K dim per DFB (64 tiles = 128KB in bf16)
+# Fused K accumulation: acc.store(prev + a @ b) for f32 precision in DST.
+# NCOLS=1 to avoid multi-tile output block accumulator leak bug.
+K_CHUNK_MAX = 64  # used for MLP proj weight chunking
 
-def make_linear_kernel(k_chunk):
-    @ttl.kernel(grid="auto")
+def make_linear_kernel(k_tiles):
+    @ttl.operation(grid="auto")
     def linear_kernel(x, w, out):
         grid_cols, _ = ttl.grid_size(dims=2)
-        k_tiles = x.shape[1] // TILE
+        m_tiles = x.shape[0] // TILE
         n_tiles = w.shape[1] // TILE
-        cols_per_core = -(-n_tiles // grid_cols)
+        total = m_tiles * n_tiles
+        units_per_core = -(-total // grid_cols)
 
-        x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_chunk), buffer_factor=2)
-        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_chunk, 1), buffer_factor=2)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        a_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(1, 1), buffer_factor=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1))
 
         @ttl.compute()
         def compute():
-            core_x, _ = ttl.core(dims=2)
-            for local_j in range(cols_per_core):
-                j = core_x * cols_per_core + local_j
-                if j < n_tiles:
-                    with x_dfb.wait() as xv, w_dfb.wait() as wv, out_dfb.reserve() as o:
-                        o.store(xv @ wv)
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    with a_dfb.wait() as av, w_dfb.wait() as wv:
+                        with acc_dfb.reserve() as acc:
+                            acc.store(av @ wv)
+                    for k in range(1, k_tiles):
+                        with a_dfb.wait() as av, w_dfb.wait() as wv, acc_dfb.wait() as prev:
+                            with acc_dfb.reserve() as acc:
+                                acc.store(prev + av @ wv)
+                    with acc_dfb.wait() as final:
+                        with out_dfb.reserve() as o:
+                            o.store(final)
 
         @ttl.datamovement()
         def dm_read():
-            core_x, _ = ttl.core(dims=2)
-            for local_j in range(cols_per_core):
-                j = core_x * cols_per_core + local_j
-                if j < n_tiles:
-                    with x_dfb.reserve() as blk:
-                        tx = ttl.copy(x[0, 0:k_chunk], blk); tx.wait()
-                    with w_dfb.reserve() as blk:
-                        tx = ttl.copy(w[0:k_chunk, j], blk); tx.wait()
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    mi = t // n_tiles
+                    ni = t % n_tiles
+                    for k in range(k_tiles):
+                        with a_dfb.reserve() as blk:
+                            tx = ttl.copy(x[mi, k], blk); tx.wait()
+                        with w_dfb.reserve() as blk:
+                            tx = ttl.copy(w[k, ni], blk); tx.wait()
 
         @ttl.datamovement()
         def dm_write():
-            core_x, _ = ttl.core(dims=2)
-            for local_j in range(cols_per_core):
-                j = core_x * cols_per_core + local_j
-                if j < n_tiles:
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    mi = t // n_tiles
+                    ni = t % n_tiles
                     with out_dfb.wait() as blk:
-                        tx = ttl.copy(blk, out[0, j]); tx.wait()
+                        tx = ttl.copy(blk, out[mi, ni]); tx.wait()
 
     return linear_kernel
 
-# Standard linear for k_tiles <= 64 (covers 2048-wide inputs)
+# Standard linear for nanochat projections (K=64 for 2048-wide inputs)
 linear_kernel = make_linear_kernel(64)
 
 
 # -- Elementwise ReLU squared --
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def relu_sq_kernel(x, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     row_tiles = x.shape[0] // TILE
@@ -219,7 +235,7 @@ def relu_sq_kernel(x, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -229,7 +245,7 @@ def relu_sq_kernel(x, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -240,7 +256,7 @@ def relu_sq_kernel(x, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -251,7 +267,7 @@ def relu_sq_kernel(x, out):
 
 
 # -- Rotary embeddings --
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def rotary_kernel(x, cos, sin, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     seq_tiles = x.shape[0] // TILE
@@ -265,7 +281,7 @@ def rotary_kernel(x, cos, sin, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < seq_tiles:
@@ -278,7 +294,7 @@ def rotary_kernel(x, cos, sin, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < seq_tiles:
@@ -294,7 +310,7 @@ def rotary_kernel(x, cos, sin, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < seq_tiles:
@@ -306,7 +322,7 @@ def rotary_kernel(x, cos, sin, out):
 
 
 # -- Residual add: out = x + y --
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def residual_add_kernel(x, y, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     row_tiles = x.shape[0] // TILE
@@ -320,7 +336,7 @@ def residual_add_kernel(x, y, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -329,7 +345,7 @@ def residual_add_kernel(x, y, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -342,7 +358,7 @@ def residual_add_kernel(x, y, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -353,7 +369,7 @@ def residual_add_kernel(x, y, out):
 
 
 # -- Scaled residual: out = lr * x + l0 * x0 --
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     row_tiles = x.shape[0] // TILE
@@ -369,7 +385,7 @@ def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         with lr_dfb.wait() as lr, l0_dfb.wait() as l0:
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
@@ -379,7 +395,7 @@ def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         with lr_dfb.reserve() as blk:
             tx = ttl.copy(lambda_r_tile[0, 0], blk); tx.wait()
         with l0_dfb.reserve() as blk:
@@ -396,7 +412,7 @@ def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -407,7 +423,7 @@ def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
 
 
 # -- Softcap: out = cap * tanh(x / cap) --
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def softcap_kernel(x, inv_cap_tile, cap_tile, out):
     grid_cols, _ = ttl.grid_size(dims=2)
     row_tiles = x.shape[0] // TILE
@@ -422,7 +438,7 @@ def softcap_kernel(x, inv_cap_tile, cap_tile, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         with ic_dfb.wait() as ic, c_dfb.wait() as cap:
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
@@ -432,7 +448,7 @@ def softcap_kernel(x, inv_cap_tile, cap_tile, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         with ic_dfb.reserve() as blk:
             tx = ttl.copy(inv_cap_tile[0, 0], blk); tx.wait()
         with c_dfb.reserve() as blk:
@@ -447,7 +463,7 @@ def softcap_kernel(x, inv_cap_tile, cap_tile, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -458,7 +474,7 @@ def softcap_kernel(x, inv_cap_tile, cap_tile, out):
 
 
 # -- SDPA with attention mask --
-@ttl.kernel(grid=(1, 1))
+@ttl.operation(grid=(1, 1))
 def sdpa_kernel(Q, K, V, scale_tile, scaler, mask, out):
     sq_tiles = Q.shape[0] // TILE
     skv_tiles = K.shape[0] // TILE
@@ -492,9 +508,9 @@ def sdpa_kernel(Q, K, V, scale_tile, scaler, mask, out):
             qk.store(qv @ ktv)
         # scaled = scale * QK + mask (two-step broadcast: rows then cols)
         with scale_dfb.wait() as s, scale_row_dfb.reserve() as sr:
-            sr.store(ttl.math.broadcast(s, dims=[0]))
+            sr.store(ttl.math.broadcast(s, sr, dims=[0]))
         with scale_row_dfb.wait() as sr, scale_bcast_dfb.reserve() as sb:
-            sb.store(ttl.math.broadcast(sr, dims=[1]))
+            sb.store(ttl.math.broadcast(sr, sb, dims=[1]))
         with scale_bcast_dfb.wait() as sb, qk_dfb.wait() as qkv, mask_dfb.wait() as m, scaled_dfb.reserve() as scd:
             scd.store(sb * qkv + m)
         # Softmax (row-wise)
@@ -502,14 +518,14 @@ def sdpa_kernel(Q, K, V, scale_tile, scaler, mask, out):
             with max_dfb.reserve() as mx:
                 mx.store(ttl.math.reduce_max(sdv, sc, dims=[1]))
             with max_dfb.wait() as mxv, max_bcast_dfb.reserve() as mxb:
-                mxb.store(ttl.math.broadcast(mxv, dims=[1]))
+                mxb.store(ttl.math.broadcast(mxv, mxb, dims=[1]))
             with max_bcast_dfb.wait() as mxbv:
                 with exp_dfb.reserve() as ex:
                     ex.store(ttl.math.exp(sdv - mxbv))
                 with exp_dfb.wait() as exv, sum_dfb.reserve() as sm:
                     sm.store(ttl.math.reduce_sum(exv, sc, dims=[1]))
                 with sum_dfb.wait() as smv, sum_bcast_dfb.reserve() as smb:
-                    smb.store(ttl.math.broadcast(smv, dims=[1]))
+                    smb.store(ttl.math.broadcast(smv, smb, dims=[1]))
                 with sum_bcast_dfb.wait() as smbv, qk_dfb.reserve() as attn:
                     attn.store(ttl.math.exp(sdv - mxbv) / smbv)
         # out = attn @ V
@@ -963,8 +979,8 @@ if __name__ == "__main__":
                         help="Checkpoint directory")
     parser.add_argument("--step", type=int, default=650, help="Checkpoint step")
     parser.add_argument("--tokenizer-dir", type=str,
-                        default=os.path.expanduser("~/.cache/nanochat/tokenizer"),
-                        help="Tokenizer directory")
+                        default=None,
+                        help="Tokenizer directory (default: same as checkpoint dir)")
     parser.add_argument("--prompt", type=str, default="The chemical formula of water is",
                         help="Input prompt")
     parser.add_argument("--max-tokens", type=int, default=64, help="Max tokens to generate")
@@ -987,7 +1003,8 @@ if __name__ == "__main__":
     print(f"  Config: {model_config}")
 
     print("Loading tokenizer...")
-    tokenizer = load_tokenizer(args.tokenizer_dir)
+    tok_dir = args.tokenizer_dir if args.tokenizer_dir else args.checkpoint_dir
+    tokenizer = load_tokenizer(tok_dir)
 
     print("Building model (loading weights to device)...")
     model = NanochatModel(state, model_config, tokenizer, device)

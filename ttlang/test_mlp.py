@@ -20,7 +20,7 @@ def to_ttnn(tensor, device):
 
 
 # --- Elementwise ReLU² kernel ---
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def relu_sq_kernel(x, out):
     """Elementwise relu²: out = relu(x)²"""
     grid_cols, _ = ttl.grid_size(dims=2)
@@ -34,7 +34,7 @@ def relu_sq_kernel(x, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -44,7 +44,7 @@ def relu_sq_kernel(x, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -55,7 +55,7 @@ def relu_sq_kernel(x, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -65,46 +65,64 @@ def relu_sq_kernel(x, out):
                     tx = ttl.copy(blk, out[row, col]); tx.wait()
 
 
-# --- Linear projection kernel (same as test_linear.py) ---
-@ttl.kernel(grid="auto")
-def linear_kernel(x, w, out):
-    grid_cols, _ = ttl.grid_size(dims=2)
-    k_tiles = x.shape[1] // TILE
-    n_tiles = w.shape[1] // TILE
-    cols_per_core = -(-n_tiles // grid_cols)
+# --- Linear projection kernel (fused K accumulation) ---
+def make_linear_kernel(k_tiles):
+    @ttl.operation(grid="auto")
+    def linear_kernel(x, w, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        m_tiles = x.shape[0] // TILE
+        n_tiles = w.shape[1] // TILE
+        total = m_tiles * n_tiles
+        units_per_core = -(-total // grid_cols)
 
-    x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_tiles), buffer_factor=2)
-    w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_tiles, 1), buffer_factor=2)
-    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        a_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(1, 1), buffer_factor=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1))
 
-    @ttl.compute()
-    def compute():
-        core_x, _ = ttl.core(dims=2)
-        for local_j in range(cols_per_core):
-            j = core_x * cols_per_core + local_j
-            if j < n_tiles:
-                with x_dfb.wait() as xv, w_dfb.wait() as wv, out_dfb.reserve() as o:
-                    o.store(xv @ wv)
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    with a_dfb.wait() as av, w_dfb.wait() as wv:
+                        with acc_dfb.reserve() as acc:
+                            acc.store(av @ wv)
+                    for k in range(1, k_tiles):
+                        with a_dfb.wait() as av, w_dfb.wait() as wv, acc_dfb.wait() as prev:
+                            with acc_dfb.reserve() as acc:
+                                acc.store(prev + av @ wv)
+                    with acc_dfb.wait() as final:
+                        with out_dfb.reserve() as o:
+                            o.store(final)
 
-    @ttl.datamovement()
-    def dm_read():
-        core_x, _ = ttl.core(dims=2)
-        for local_j in range(cols_per_core):
-            j = core_x * cols_per_core + local_j
-            if j < n_tiles:
-                with x_dfb.reserve() as blk:
-                    tx = ttl.copy(x[0, 0:k_tiles], blk); tx.wait()
-                with w_dfb.reserve() as blk:
-                    tx = ttl.copy(w[0:k_tiles, j], blk); tx.wait()
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    mi = t // n_tiles
+                    ni = t % n_tiles
+                    for k in range(k_tiles):
+                        with a_dfb.reserve() as blk:
+                            tx = ttl.copy(x[mi, k], blk); tx.wait()
+                        with w_dfb.reserve() as blk:
+                            tx = ttl.copy(w[k, ni], blk); tx.wait()
 
-    @ttl.datamovement()
-    def dm_write():
-        core_x, _ = ttl.core(dims=2)
-        for local_j in range(cols_per_core):
-            j = core_x * cols_per_core + local_j
-            if j < n_tiles:
-                with out_dfb.wait() as blk:
-                    tx = ttl.copy(blk, out[0, j]); tx.wait()
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    mi = t // n_tiles
+                    ni = t % n_tiles
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, out[mi, ni]); tx.wait()
+
+    return linear_kernel
 
 
 def torch_mlp(x, w_fc, w_proj):
@@ -136,9 +154,12 @@ if __name__ == "__main__":
     w_proj = torch.randn(MLP_SMALL, N_EMBD_SMALL, dtype=torch.bfloat16) * 0.01
     expected2 = torch_mlp(x2, w_fc, w_proj)
 
+    linear_k8 = make_linear_kernel(N_EMBD_SMALL // TILE)
+    linear_k32 = make_linear_kernel(MLP_SMALL // TILE)
+
     # Step 1: x @ w_fc -> hidden
     hidden_tt = to_ttnn(torch.zeros(32, MLP_SMALL, dtype=torch.bfloat16), device)
-    linear_kernel(to_ttnn(x2, device), to_ttnn(w_fc, device), hidden_tt)
+    linear_k8(to_ttnn(x2, device), to_ttnn(w_fc, device), hidden_tt)
 
     # Step 2: relu²(hidden) -> hidden_act
     hidden_act_tt = to_ttnn(torch.zeros(32, MLP_SMALL, dtype=torch.bfloat16), device)
@@ -146,7 +167,7 @@ if __name__ == "__main__":
 
     # Step 3: hidden_act @ w_proj -> out
     out2 = to_ttnn(torch.zeros(32, N_EMBD_SMALL, dtype=torch.bfloat16), device)
-    linear_kernel(hidden_act_tt, to_ttnn(w_proj, device), out2)
+    linear_k32(hidden_act_tt, to_ttnn(w_proj, device), out2)
 
     result2 = ttnn.to_torch(out2)
     err2 = (expected2.float() - result2.float()).abs().max().item()
@@ -166,14 +187,17 @@ if __name__ == "__main__":
     w_proj3 = torch.randn(MLP_DIM, N_EMBD, dtype=torch.bfloat16) * 0.01
     expected3 = torch_mlp(x3, w_fc3, w_proj3)
 
+    linear_k64 = make_linear_kernel(N_EMBD // TILE)
+    linear_k256 = make_linear_kernel(MLP_DIM // TILE)
+
     hidden3 = to_ttnn(torch.zeros(32, MLP_DIM, dtype=torch.bfloat16), device)
-    linear_kernel(to_ttnn(x3, device), to_ttnn(w_fc3, device), hidden3)
+    linear_k64(to_ttnn(x3, device), to_ttnn(w_fc3, device), hidden3)
 
     hidden_act3 = to_ttnn(torch.zeros(32, MLP_DIM, dtype=torch.bfloat16), device)
     relu_sq_kernel(hidden3, hidden_act3)
 
     out3 = to_ttnn(torch.zeros(32, N_EMBD, dtype=torch.bfloat16), device)
-    linear_kernel(hidden_act3, to_ttnn(w_proj3, device), out3)
+    linear_k256(hidden_act3, to_ttnn(w_proj3, device), out3)
 
     result3 = ttnn.to_torch(out3)
     err3 = (expected3.float() - result3.float()).abs().max().item()

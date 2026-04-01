@@ -19,7 +19,7 @@ def to_ttnn(tensor, device):
         device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def residual_add_kernel(x, y, out):
     """out = x + y, elementwise streaming."""
     grid_cols, _ = ttl.grid_size(dims=2)
@@ -34,7 +34,7 @@ def residual_add_kernel(x, y, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -43,7 +43,7 @@ def residual_add_kernel(x, y, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -56,7 +56,7 @@ def residual_add_kernel(x, y, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -66,7 +66,7 @@ def residual_add_kernel(x, y, out):
                     tx = ttl.copy(blk, out[row, col]); tx.wait()
 
 
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
     """out = lambda_r * x + lambda_0 * x0 (per-layer residual scaling).
 
@@ -86,7 +86,7 @@ def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         with lr_dfb.wait() as lr, l0_dfb.wait() as l0:
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
@@ -96,7 +96,7 @@ def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         with lr_dfb.reserve() as blk:
             tx = ttl.copy(lambda_r_tile[0, 0], blk); tx.wait()
         with l0_dfb.reserve() as blk:
@@ -113,7 +113,7 @@ def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -123,7 +123,7 @@ def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
                     tx = ttl.copy(blk, out[row, col]); tx.wait()
 
 
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def softcap_kernel(x, inv_cap_tile, cap_tile, out):
     """out = softcap * tanh(x / softcap) = softcap * tanh(x * inv_softcap)"""
     grid_cols, _ = ttl.grid_size(dims=2)
@@ -139,7 +139,7 @@ def softcap_kernel(x, inv_cap_tile, cap_tile, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         with ic_dfb.wait() as ic, c_dfb.wait() as cap:
             for local_t in range(tiles_per_core):
                 t = core_x * tiles_per_core + local_t
@@ -149,7 +149,7 @@ def softcap_kernel(x, inv_cap_tile, cap_tile, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         with ic_dfb.reserve() as blk:
             tx = ttl.copy(inv_cap_tile[0, 0], blk); tx.wait()
         with c_dfb.reserve() as blk:
@@ -164,7 +164,7 @@ def softcap_kernel(x, inv_cap_tile, cap_tile, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:

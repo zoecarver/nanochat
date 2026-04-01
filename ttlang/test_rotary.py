@@ -29,7 +29,7 @@ def to_ttnn(tensor, device):
         device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def rotary_kernel(x, cos, sin, out):
     """Apply rotary embeddings to a single head.
 
@@ -56,7 +56,7 @@ def rotary_kernel(x, cos, sin, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < seq_tiles:
@@ -71,7 +71,7 @@ def rotary_kernel(x, cos, sin, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < seq_tiles:
@@ -87,7 +87,7 @@ def rotary_kernel(x, cos, sin, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < seq_tiles:

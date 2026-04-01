@@ -31,7 +31,7 @@ def to_ttnn(tensor, device):
         device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
-@ttl.kernel(grid=(1, 1))
+@ttl.operation(grid=(1, 1))
 def sdpa_kernel(Q, K, V, scale_tile, scaler, out):
     """SDPA: out = softmax(Q @ K^T / sqrt(d)) @ V
 
@@ -78,9 +78,9 @@ def sdpa_kernel(Q, K, V, scale_tile, scaler, out):
 
         # Step 3: QK_scaled = QK * scale (two-step broadcast: rows then cols)
         with scale_dfb.wait() as s, scale_row_dfb.reserve() as sr:
-            sr.store(ttl.math.broadcast(s, dims=[0]))
+            sr.store(ttl.math.broadcast(s, sr, dims=[0]))
         with scale_row_dfb.wait() as sr, scale_bcast_dfb.reserve() as sb:
-            sb.store(ttl.math.broadcast(sr, dims=[1]))
+            sb.store(ttl.math.broadcast(sr, sb, dims=[1]))
         with scale_bcast_dfb.wait() as sb, qk_dfb.wait() as qkv, scaled_dfb.reserve() as scd:
             scd.store(sb * qkv)
 
@@ -92,7 +92,7 @@ def sdpa_kernel(Q, K, V, scale_tile, scaler, out):
 
             # 5. Broadcast max for subtraction
             with max_dfb.wait() as mxv, max_bcast_dfb.reserve() as mxb:
-                mxb.store(ttl.math.broadcast(mxv, dims=[1]))
+                mxb.store(ttl.math.broadcast(mxv, mxb, dims=[1]))
 
             with max_bcast_dfb.wait() as mxbv:
                 # 6. exp(scaled - max)
@@ -105,7 +105,7 @@ def sdpa_kernel(Q, K, V, scale_tile, scaler, out):
 
                 # 8. Broadcast sum
                 with sum_dfb.wait() as smv, sum_bcast_dfb.reserve() as smb:
-                    smb.store(ttl.math.broadcast(smv, dims=[1]))
+                    smb.store(ttl.math.broadcast(smv, smb, dims=[1]))
 
                 # 9. attn_weights = exp(scaled - max) / sum
                 with sum_bcast_dfb.wait() as smbv, qk_dfb.reserve() as attn:

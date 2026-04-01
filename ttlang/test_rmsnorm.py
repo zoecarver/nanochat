@@ -24,7 +24,7 @@ def to_ttnn(tensor, device):
         device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
-@ttl.kernel(grid="auto")
+@ttl.operation(grid="auto")
 def rmsnorm_kernel(x, scaler, mean_scale, out):
     """RMSNorm: out = x * rsqrt(mean(x^2) + eps)
 
@@ -50,7 +50,7 @@ def rmsnorm_kernel(x, scaler, mean_scale, out):
 
     @ttl.compute()
     def compute():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         with sc_dfb.wait() as sc, ms_dfb.wait() as ms:
             for local_t in range(tiles_per_core):
                 tile_idx = core_x * tiles_per_core + local_t
@@ -74,7 +74,7 @@ def rmsnorm_kernel(x, scaler, mean_scale, out):
 
                     # Broadcast col 0 to all cols, scale by 1/N, rsqrt
                     with acc_dfb.wait() as total, bcast_dfb.reserve() as bc:
-                        bc.store(ttl.math.broadcast(total, dims=[1]))
+                        bc.store(ttl.math.broadcast(total, bc, dims=[1]))
                     with bcast_dfb.wait() as bv, red_dfb.reserve() as scaled:
                         scaled.store(bv * ms)
                     with red_dfb.wait() as msq, rsq_dfb.reserve() as rsq:
@@ -88,7 +88,7 @@ def rmsnorm_kernel(x, scaler, mean_scale, out):
 
     @ttl.datamovement()
     def dm_read():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         with sc_dfb.reserve() as blk:
             tx = ttl.copy(scaler[0, 0], blk); tx.wait()
         with ms_dfb.reserve() as blk:
@@ -107,7 +107,7 @@ def rmsnorm_kernel(x, scaler, mean_scale, out):
 
     @ttl.datamovement()
     def dm_write():
-        core_x, _ = ttl.core(dims=2)
+        core_x, _ = ttl.node(dims=2)
         for local_t in range(tiles_per_core):
             tile_idx = core_x * tiles_per_core + local_t
             if tile_idx < seq_tiles:

@@ -1,13 +1,13 @@
-# Test matmul shapes to determine what works on HW.
-# We need: (seq, 2048) @ (2048, 8192) for MLP.
-# Strategy: stream weight columns in chunks, accumulate partial results.
-# But first let's test basic matmul shapes to see what compiles.
+# Test matmul with fused K accumulation (Strategy 1 from tt-lang reference).
+# Pattern: acc.store(prev + a @ b) fuses the accumulation with the matmul,
+# keeping the K accumulation in f32 DST.
 
 import torch
 import ttnn
 import ttl
 
 TILE = 32
+NCOLS = 8
 
 
 def to_ttnn(tensor, device):
@@ -16,104 +16,118 @@ def to_ttnn(tensor, device):
         device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
-# Test 1: Square matmul (1,1) @ (1,1) = (1,1) - should always work
-@ttl.kernel(grid=(1, 1))
-def matmul_1x1(a, b, out):
-    a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), buffer_factor=2)
-    b_dfb = ttl.make_dataflow_buffer_like(b, shape=(1, 1), buffer_factor=2)
-    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+def make_matmul(block_n):
+    """Fused K accumulation matmul: out = a @ w.
 
-    @ttl.compute()
-    def compute():
-        with a_dfb.wait() as av, b_dfb.wait() as bv, out_dfb.reserve() as o:
-            o.store(av @ bv)
+    Streams K=1 tile at a time. First step seeds accumulator with a@w,
+    remaining steps fuse: acc.store(prev + a @ b).
+    """
+    @ttl.operation(grid="auto")
+    def matmul(a, w, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        Mt = a.shape[0] // TILE
+        Kt = a.shape[1] // TILE
+        Nt = w.shape[1] // TILE
+        num_n = Nt // block_n
+        total = Mt * num_n
+        units_per_core = -(-total // grid_cols)
 
-    @ttl.datamovement()
-    def dm_read():
-        with a_dfb.reserve() as blk:
-            tx = ttl.copy(a[0, 0], blk); tx.wait()
-        with b_dfb.reserve() as blk:
-            tx = ttl.copy(b[0, 0], blk); tx.wait()
+        a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, 1), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(1, block_n), buffer_factor=2)
+        acc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, block_n), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, block_n))
 
-    @ttl.datamovement()
-    def dm_write():
-        with out_dfb.wait() as blk:
-            tx = ttl.copy(blk, out[0, 0]); tx.wait()
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    # First K step: seed accumulator
+                    with a_dfb.wait() as av, w_dfb.wait() as wv:
+                        with acc_dfb.reserve() as acc:
+                            acc.store(av @ wv)
+                    # Remaining K steps: fused accumulate
+                    for k in range(1, Kt):
+                        with a_dfb.wait() as av, w_dfb.wait() as wv, acc_dfb.wait() as prev:
+                            with acc_dfb.reserve() as acc:
+                                acc.store(prev + av @ wv)
+                    # Write result
+                    with acc_dfb.wait() as final:
+                        with out_dfb.reserve() as o:
+                            o.store(final)
 
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    mi = t // num_n
+                    ni = t % num_n
+                    n_off = ni * block_n
+                    for k in range(Kt):
+                        with a_dfb.reserve() as blk:
+                            tx = ttl.copy(a[mi, k], blk); tx.wait()
+                        with w_dfb.reserve() as blk:
+                            tx = ttl.copy(w[k, n_off:n_off + block_n], blk); tx.wait()
 
-# Test 2: Non-square (1,2) @ (2,1) = (1,1) - accumulating K dim
-@ttl.kernel(grid=(1, 1))
-def matmul_accum(a, b, out):
-    """Accumulate matmul over K dimension using multi-tile DFB for K accumulation in DST."""
-    k_tiles = a.shape[1] // TILE
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    mi = t // num_n
+                    ni = t % num_n
+                    n_off = ni * block_n
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, out[mi, n_off:n_off + block_n]); tx.wait()
 
-    # Use multi-tile DFBs: a is (1, K), b is (K, 1), matmul produces (1, 1) with K accumulated in DST
-    a_dfb = ttl.make_dataflow_buffer_like(a, shape=(1, k_tiles), buffer_factor=2)
-    b_dfb = ttl.make_dataflow_buffer_like(b, shape=(k_tiles, 1), buffer_factor=2)
-    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
-
-    @ttl.compute()
-    def compute():
-        with a_dfb.wait() as av, b_dfb.wait() as bv, out_dfb.reserve() as o:
-            o.store(av @ bv)
-
-    @ttl.datamovement()
-    def dm_read():
-        with a_dfb.reserve() as blk:
-            tx = ttl.copy(a[0, 0:k_tiles], blk); tx.wait()
-        with b_dfb.reserve() as blk:
-            tx = ttl.copy(b[0:k_tiles, 0], blk); tx.wait()
-
-    @ttl.datamovement()
-    def dm_write():
-        with out_dfb.wait() as blk:
-            tx = ttl.copy(blk, out[0, 0]); tx.wait()
+    return matmul
 
 
 if __name__ == "__main__":
     device = ttnn.open_device(device_id=0)
     torch.manual_seed(42)
 
-    # Test 1: 32x32 @ 32x32
-    print("=== Test 1: (32,32) @ (32,32) ===")
-    a1 = torch.randn(32, 32, dtype=torch.bfloat16)
-    b1 = torch.randn(32, 32, dtype=torch.bfloat16)
-    expected1 = (a1.float() @ b1.float()).to(torch.bfloat16)
-    out1 = to_ttnn(torch.zeros(32, 32, dtype=torch.bfloat16), device)
-    matmul_1x1(to_ttnn(a1, device), to_ttnn(b1, device), out1)
+    # Test 1: K=2 (64 elem)
+    print("=== Test 1: (32,64) @ (64,256) K=2 ===")
+    a1 = torch.randn(32, 64, dtype=torch.bfloat16)
+    w1 = torch.randn(64, 256, dtype=torch.bfloat16)
+    expected1 = (a1.float() @ w1.float()).to(torch.bfloat16)
+    out1 = to_ttnn(torch.zeros(32, 256, dtype=torch.bfloat16), device)
+    make_matmul(NCOLS)(to_ttnn(a1, device), to_ttnn(w1, device), out1)
     result1 = ttnn.to_torch(out1)
     err1 = (expected1.float() - result1.float()).abs().max().item()
-    print(f"  Expected[0,:4]: {expected1[0,:4]}")
-    print(f"  Got[0,:4]:      {result1[0,:4]}")
-    print(f"  Max error: {err1:.4f}")
-    print(f"  {'PASS' if err1 < 2.0 else 'FAIL'}")
+    print(f"  Max error: {err1:.4f} {'PASS' if err1 < 2.0 else 'FAIL'}")
 
-    # Test 2: (32, 64) @ (64, 32) via accumulating K=2
-    print("\n=== Test 2: (32,64) @ (64,32) accum K=2 ===")
-    a2 = torch.randn(32, 64, dtype=torch.bfloat16)
-    b2 = torch.randn(64, 32, dtype=torch.bfloat16)
-    expected2 = (a2.float() @ b2.float()).to(torch.bfloat16)
-    out2 = to_ttnn(torch.zeros(32, 32, dtype=torch.bfloat16), device)
-    matmul_accum(to_ttnn(a2, device), to_ttnn(b2, device), out2)
+    # Test 2: K=64 (2048 elem) - Q/K/V projection size
+    print("\n=== Test 2: (32,2048) @ (2048,2048) K=64 ===")
+    a2 = torch.randn(32, 2048, dtype=torch.bfloat16)
+    w2 = torch.randn(2048, 2048, dtype=torch.bfloat16)
+    expected2 = (a2.float() @ w2.float()).to(torch.bfloat16)
+    out2 = to_ttnn(torch.zeros(32, 2048, dtype=torch.bfloat16), device)
+    make_matmul(NCOLS)(to_ttnn(a2, device), to_ttnn(w2, device), out2)
     result2 = ttnn.to_torch(out2)
     err2 = (expected2.float() - result2.float()).abs().max().item()
+    mean2 = (expected2.float() - result2.float()).abs().mean().item()
     print(f"  Expected[0,:4]: {expected2[0,:4]}")
     print(f"  Got[0,:4]:      {result2[0,:4]}")
-    print(f"  Max error: {err2:.4f}")
-    print(f"  {'PASS' if err2 < 2.0 else 'FAIL'}")
+    print(f"  Max error: {err2:.4f}, Mean: {mean2:.4f}")
+    print(f"  {'PASS' if err2 < 5.0 else 'FAIL'}")
 
-    # Test 3: Larger K - (32, 2048) @ (2048, 32) via accum K=64
-    print("\n=== Test 3: (32,2048) @ (2048,32) accum K=64 ===")
+    # Test 3: K=64, N=8192 - MLP fc size
+    print("\n=== Test 3: (32,2048) @ (2048,8192) K=64 MLP fc ===")
     a3 = torch.randn(32, 2048, dtype=torch.bfloat16)
-    b3 = torch.randn(2048, 32, dtype=torch.bfloat16)
-    expected3 = (a3.float() @ b3.float()).to(torch.bfloat16)
-    out3 = to_ttnn(torch.zeros(32, 32, dtype=torch.bfloat16), device)
-    matmul_accum(to_ttnn(a3, device), to_ttnn(b3, device), out3)
+    w3 = torch.randn(2048, 8192, dtype=torch.bfloat16)
+    expected3 = (a3.float() @ w3.float()).to(torch.bfloat16)
+    out3 = to_ttnn(torch.zeros(32, 8192, dtype=torch.bfloat16), device)
+    make_matmul(NCOLS)(to_ttnn(a3, device), to_ttnn(w3, device), out3)
     result3 = ttnn.to_torch(out3)
     err3 = (expected3.float() - result3.float()).abs().max().item()
-    print(f"  Expected[0,:4]: {expected3[0,:4]}")
-    print(f"  Got[0,:4]:      {result3[0,:4]}")
-    print(f"  Max error: {err3:.4f}")
+    mean3 = (expected3.float() - result3.float()).abs().mean().item()
+    print(f"  Max error: {err3:.4f}, Mean: {mean3:.4f}")
     print(f"  {'PASS' if err3 < 5.0 else 'FAIL'}")
 
     ttnn.close_device(device)
