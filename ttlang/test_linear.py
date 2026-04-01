@@ -15,7 +15,7 @@ import ttnn
 import ttl
 
 TILE = 32
-NCOLS = 1  # Output columns per work unit (NCOLS>1 triggers accum leak bug)
+NCOLS = 4  # Output columns per work unit
 
 
 def to_ttnn(tensor, device):
@@ -34,10 +34,9 @@ def make_linear_kernel(k_tiles):
         total = m_tiles * col_groups
         units_per_core = -(-total // grid_cols)
 
-        a_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
-        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(1, NCOLS), buffer_factor=2)
-        acc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, NCOLS), buffer_factor=2)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, NCOLS))
+        a_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_tiles), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_tiles, NCOLS), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, NCOLS), buffer_factor=2)
 
         @ttl.compute()
         def compute():
@@ -45,19 +44,12 @@ def make_linear_kernel(k_tiles):
             for local_t in range(units_per_core):
                 t = core_x * units_per_core + local_t
                 if t < total:
-                    # First K step: seed accumulator
-                    with a_dfb.wait() as av, w_dfb.wait() as wv:
-                        with acc_dfb.reserve() as acc:
-                            acc.store(av @ wv)
-                    # Remaining K steps: fused accumulate
-                    for k in range(1, k_tiles):
-                        with a_dfb.wait() as av, w_dfb.wait() as wv, acc_dfb.wait() as prev:
-                            with acc_dfb.reserve() as acc:
-                                acc.store(prev + av @ wv)
-                    # Write result
-                    with acc_dfb.wait() as final:
-                        with out_dfb.reserve() as o:
-                            o.store(final)
+                    a_blk = a_dfb.wait()
+                    w_blk = w_dfb.wait()
+                    with out_dfb.reserve() as o:
+                        o.store(a_blk @ w_blk)
+                    a_blk.pop()
+                    w_blk.pop()
 
         @ttl.datamovement()
         def dm_read():
@@ -67,12 +59,11 @@ def make_linear_kernel(k_tiles):
                 if t < total:
                     mi = t // col_groups
                     gi = t % col_groups
-                    n_off = gi * NCOLS
-                    for k in range(k_tiles):
-                        with a_dfb.reserve() as blk:
-                            tx = ttl.copy(x[mi, k], blk); tx.wait()
-                        with w_dfb.reserve() as blk:
-                            tx = ttl.copy(w[k, n_off:n_off + NCOLS], blk); tx.wait()
+                    sc = gi * NCOLS
+                    with a_dfb.reserve() as blk:
+                        tx = ttl.copy(x[mi, 0:k_tiles], blk); tx.wait()
+                    with w_dfb.reserve() as blk:
+                        tx = ttl.copy(w[0:k_tiles, sc:sc + NCOLS], blk); tx.wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -82,9 +73,9 @@ def make_linear_kernel(k_tiles):
                 if t < total:
                     mi = t // col_groups
                     gi = t % col_groups
-                    n_off = gi * NCOLS
+                    sc = gi * NCOLS
                     with out_dfb.wait() as blk:
-                        tx = ttl.copy(blk, out[mi, n_off:n_off + NCOLS]); tx.wait()
+                        tx = ttl.copy(blk, out[mi, sc:sc + NCOLS]); tx.wait()
 
     return linear_kernel
 

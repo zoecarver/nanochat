@@ -29,6 +29,9 @@ HEAD_DIM = 128
 HALF_DIM = HEAD_DIM // 2
 HEAD_TILES = HEAD_DIM // TILE       # 4
 HALF_TILES = HALF_DIM // TILE       # 2
+NUM_HEADS = 16
+SDPA_GRID_X = 8
+SDPA_GRID_Y = 2  # 8 * 2 = 16 cores = NUM_HEADS
 SOFTCAP = 15.0
 QK_SCALE_SQ = 1.15 * 1.15
 SDPA_SCALE_VAL = QK_SCALE_SQ / math.sqrt(HEAD_DIM)
@@ -155,9 +158,10 @@ rmsnorm_head = make_rmsnorm_kernel(HEAD_DIM)
 
 
 # -- Linear projection: out = x @ w --
-# Fused K accumulation: acc.store(prev + a @ b) for f32 precision in DST.
-# NCOLS=1 to avoid multi-tile output block accumulator leak bug.
+# Full-K-in-DFB pattern: compiler handles K accumulation in f32 DST.
+# NCOLS output columns per work unit for A-tile reuse.
 K_CHUNK_MAX = 64  # used for MLP proj weight chunking
+NCOLS = 4  # output columns per work unit (fits in L1 with K=64)
 
 def make_linear_kernel(k_tiles):
     @ttl.operation(grid="auto")
@@ -165,13 +169,13 @@ def make_linear_kernel(k_tiles):
         grid_cols, _ = ttl.grid_size(dims=2)
         m_tiles = x.shape[0] // TILE
         n_tiles = w.shape[1] // TILE
-        total = m_tiles * n_tiles
+        col_groups = n_tiles // NCOLS
+        total = m_tiles * col_groups
         units_per_core = -(-total // grid_cols)
 
-        a_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
-        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(1, 1), buffer_factor=2)
-        acc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
-        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1))
+        a_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_tiles), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_tiles, NCOLS), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, NCOLS), buffer_factor=2)
 
         @ttl.compute()
         def compute():
@@ -179,16 +183,12 @@ def make_linear_kernel(k_tiles):
             for local_t in range(units_per_core):
                 t = core_x * units_per_core + local_t
                 if t < total:
-                    with a_dfb.wait() as av, w_dfb.wait() as wv:
-                        with acc_dfb.reserve() as acc:
-                            acc.store(av @ wv)
-                    for k in range(1, k_tiles):
-                        with a_dfb.wait() as av, w_dfb.wait() as wv, acc_dfb.wait() as prev:
-                            with acc_dfb.reserve() as acc:
-                                acc.store(prev + av @ wv)
-                    with acc_dfb.wait() as final:
-                        with out_dfb.reserve() as o:
-                            o.store(final)
+                    a_blk = a_dfb.wait()
+                    w_blk = w_dfb.wait()
+                    with out_dfb.reserve() as o:
+                        o.store(a_blk @ w_blk)
+                    a_blk.pop()
+                    w_blk.pop()
 
         @ttl.datamovement()
         def dm_read():
@@ -196,13 +196,13 @@ def make_linear_kernel(k_tiles):
             for local_t in range(units_per_core):
                 t = core_x * units_per_core + local_t
                 if t < total:
-                    mi = t // n_tiles
-                    ni = t % n_tiles
-                    for k in range(k_tiles):
-                        with a_dfb.reserve() as blk:
-                            tx = ttl.copy(x[mi, k], blk); tx.wait()
-                        with w_dfb.reserve() as blk:
-                            tx = ttl.copy(w[k, ni], blk); tx.wait()
+                    mi = t // col_groups
+                    gi = t % col_groups
+                    sc = gi * NCOLS
+                    with a_dfb.reserve() as blk:
+                        tx = ttl.copy(x[mi, 0:k_tiles], blk); tx.wait()
+                    with w_dfb.reserve() as blk:
+                        tx = ttl.copy(w[0:k_tiles, sc:sc + NCOLS], blk); tx.wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -210,10 +210,11 @@ def make_linear_kernel(k_tiles):
             for local_t in range(units_per_core):
                 t = core_x * units_per_core + local_t
                 if t < total:
-                    mi = t // n_tiles
-                    ni = t % n_tiles
+                    mi = t // col_groups
+                    gi = t % col_groups
+                    sc = gi * NCOLS
                     with out_dfb.wait() as blk:
-                        tx = ttl.copy(blk, out[mi, ni]); tx.wait()
+                        tx = ttl.copy(blk, out[mi, sc:sc + NCOLS]); tx.wait()
 
     return linear_kernel
 
@@ -473,47 +474,53 @@ def softcap_kernel(x, inv_cap_tile, cap_tile, out):
                     tx = ttl.copy(blk, out[row, col]); tx.wait()
 
 
-# -- SDPA with attention mask --
-@ttl.operation(grid=(1, 1))
-def sdpa_kernel(Q, K, V, scale_tile, scaler, mask, out):
-    sq_tiles = Q.shape[0] // TILE
-    skv_tiles = K.shape[0] // TILE
+# -- Multi-head SDPA: all heads in parallel on 16 cores --
+@ttl.operation(grid=(SDPA_GRID_X, SDPA_GRID_Y))
+def sdpa_multihead(Q_all, K_all, V_all, scale_tile, scaler, mask, out):
+    """Multi-head SDPA: each core handles one attention head.
 
-    q_dfb = ttl.make_dataflow_buffer_like(Q, shape=(sq_tiles, HEAD_TILES), buffer_factor=1)
-    k_dfb = ttl.make_dataflow_buffer_like(K, shape=(skv_tiles, HEAD_TILES), buffer_factor=1)
-    v_dfb = ttl.make_dataflow_buffer_like(V, shape=(skv_tiles, HEAD_TILES), buffer_factor=1)
+    Inputs are head-batched (stacked vertically):
+      Q_all: (NUM_HEADS * sq, head_dim)
+      K_all: (NUM_HEADS * skv, head_dim)
+      V_all: (NUM_HEADS * skv, head_dim)
+      mask:  (sq, skv) -- shared across heads
+    """
+    total_q = Q_all.shape[0] // TILE
+    sq_tiles = total_q // NUM_HEADS
+    total_kv = K_all.shape[0] // TILE
+    skv_tiles = total_kv // NUM_HEADS
+
+    q_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, HEAD_TILES), buffer_factor=1)
+    k_dfb = ttl.make_dataflow_buffer_like(K_all, shape=(skv_tiles, HEAD_TILES), buffer_factor=1)
+    v_dfb = ttl.make_dataflow_buffer_like(V_all, shape=(skv_tiles, HEAD_TILES), buffer_factor=1)
     scale_dfb = ttl.make_dataflow_buffer_like(scale_tile, shape=(1, 1), buffer_factor=1)
     sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
     mask_dfb = ttl.make_dataflow_buffer_like(mask, shape=(sq_tiles, skv_tiles), buffer_factor=1)
 
-    kt_dfb = ttl.make_dataflow_buffer_like(K, shape=(HEAD_TILES, skv_tiles), buffer_factor=2)
-    qk_dfb = ttl.make_dataflow_buffer_like(Q, shape=(sq_tiles, skv_tiles), buffer_factor=2)
+    kt_dfb = ttl.make_dataflow_buffer_like(K_all, shape=(HEAD_TILES, skv_tiles), buffer_factor=2)
+    qk_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
     scale_row_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(sq_tiles, 1), buffer_factor=2)
-    scale_bcast_dfb = ttl.make_dataflow_buffer_like(Q, shape=(sq_tiles, skv_tiles), buffer_factor=2)
-    scaled_dfb = ttl.make_dataflow_buffer_like(Q, shape=(sq_tiles, skv_tiles), buffer_factor=2)
+    scale_bcast_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
+    scaled_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
     max_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(sq_tiles, 1), buffer_factor=2)
-    max_bcast_dfb = ttl.make_dataflow_buffer_like(Q, shape=(sq_tiles, skv_tiles), buffer_factor=2)
-    exp_dfb = ttl.make_dataflow_buffer_like(Q, shape=(sq_tiles, skv_tiles), buffer_factor=2)
+    max_bcast_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
+    exp_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
     sum_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(sq_tiles, 1), buffer_factor=2)
-    sum_bcast_dfb = ttl.make_dataflow_buffer_like(Q, shape=(sq_tiles, skv_tiles), buffer_factor=2)
+    sum_bcast_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
     out_dfb = ttl.make_dataflow_buffer_like(out, shape=(sq_tiles, HEAD_TILES), buffer_factor=1)
 
     @ttl.compute()
     def compute():
-        # K^T
         with k_dfb.wait() as kv, kt_dfb.reserve() as kt:
             kt.store(ttl.transpose(kv))
-        # QK = Q @ K^T
         with q_dfb.wait() as qv, kt_dfb.wait() as ktv, qk_dfb.reserve() as qk:
             qk.store(qv @ ktv)
-        # scaled = scale * QK + mask (two-step broadcast: rows then cols)
         with scale_dfb.wait() as s, scale_row_dfb.reserve() as sr:
             sr.store(ttl.math.broadcast(s, sr, dims=[0]))
         with scale_row_dfb.wait() as sr, scale_bcast_dfb.reserve() as sb:
             sb.store(ttl.math.broadcast(sr, sb, dims=[1]))
         with scale_bcast_dfb.wait() as sb, qk_dfb.wait() as qkv, mask_dfb.wait() as m, scaled_dfb.reserve() as scd:
             scd.store(sb * qkv + m)
-        # Softmax (row-wise)
         with scaled_dfb.wait() as sdv, sc_dfb.wait() as sc:
             with max_dfb.reserve() as mx:
                 mx.store(ttl.math.reduce_max(sdv, sc, dims=[1]))
@@ -528,18 +535,21 @@ def sdpa_kernel(Q, K, V, scale_tile, scaler, mask, out):
                     smb.store(ttl.math.broadcast(smv, smb, dims=[1]))
                 with sum_bcast_dfb.wait() as smbv, qk_dfb.reserve() as attn:
                     attn.store(ttl.math.exp(sdv - mxbv) / smbv)
-        # out = attn @ V
         with qk_dfb.wait() as av, v_dfb.wait() as vv, out_dfb.reserve() as o:
             o.store(av @ vv)
 
     @ttl.datamovement()
     def dm_read():
+        nx, ny = ttl.node(dims=2)
+        h = ny * SDPA_GRID_X + nx
+        q_off = h * sq_tiles
+        kv_off = h * skv_tiles
         with q_dfb.reserve() as blk:
-            tx = ttl.copy(Q[0:sq_tiles, 0:HEAD_TILES], blk); tx.wait()
+            tx = ttl.copy(Q_all[q_off:q_off + sq_tiles, 0:HEAD_TILES], blk); tx.wait()
         with k_dfb.reserve() as blk:
-            tx = ttl.copy(K[0:skv_tiles, 0:HEAD_TILES], blk); tx.wait()
+            tx = ttl.copy(K_all[kv_off:kv_off + skv_tiles, 0:HEAD_TILES], blk); tx.wait()
         with v_dfb.reserve() as blk:
-            tx = ttl.copy(V[0:skv_tiles, 0:HEAD_TILES], blk); tx.wait()
+            tx = ttl.copy(V_all[kv_off:kv_off + skv_tiles, 0:HEAD_TILES], blk); tx.wait()
         with scale_dfb.reserve() as blk:
             tx = ttl.copy(scale_tile[0, 0], blk); tx.wait()
         with sc_dfb.reserve() as blk:
@@ -549,8 +559,11 @@ def sdpa_kernel(Q, K, V, scale_tile, scaler, mask, out):
 
     @ttl.datamovement()
     def dm_write():
+        nx, ny = ttl.node(dims=2)
+        h = ny * SDPA_GRID_X + nx
+        q_off = h * sq_tiles
         with out_dfb.wait() as blk:
-            tx = ttl.copy(blk, out[0:sq_tiles, 0:HEAD_TILES]); tx.wait()
+            tx = ttl.copy(blk, out[q_off:q_off + sq_tiles, 0:HEAD_TILES]); tx.wait()
 
 
 # ---------------------------------------------------------------------------
@@ -781,8 +794,8 @@ class NanochatModel:
             mask_cpu[:, cache_len:] = -10000.0
         mask_tt = to_ttnn(mask_cpu, device)
 
-        # SDPA output per head
-        sdpa_out_tt = to_ttnn(torch.zeros(TILE, HEAD_DIM, dtype=torch.bfloat16), device)
+        # Multi-head SDPA output (all heads batched)
+        sdpa_out_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
 
         for layer_idx in range(self.n_layer):
             # -- Scaled residual: temp = lr*x + l0*x0 --
@@ -832,7 +845,7 @@ class NanochatModel:
             rmsnorm_head(k_rot_tt, self.scaler_tt, self.ms_head_tt, k_norm_tt)
 
             # -- Read back normed Q, K and split into heads --
-            q_normed_cpu = ttnn.to_torch(q_norm_tt)
+            q_normed_cpu = ttnn.to_torch(q_norm_tt)  # (n_head*32, 128)
             k_normed_cpu = ttnn.to_torch(k_norm_tt)
             q_heads = q_normed_cpu.view(n_head, TILE, HEAD_DIM)
             k_heads = k_normed_cpu.view(n_head, TILE, HEAD_DIM)
@@ -840,32 +853,36 @@ class NanochatModel:
             # V heads (already on CPU, not batched through rotary/norm)
             v_heads = v_cpu.view(TILE, n_head, HEAD_DIM).permute(1, 0, 2).contiguous()
 
-            # -- Update KV cache and run SDPA per head --
-            attn_results = []
+            # -- Update KV cache and build batched K/V for all heads --
+            k_all_list = []
+            v_all_list = []
             for h in range(n_head):
-                # Update cache with row 0 (the real token)
                 self.k_cache[layer_idx][h][pos] = k_heads[h, 0]
                 self.v_cache[layer_idx][h][pos] = v_heads[h, 0]
 
-                # Prepare cached K, V (padded to tile multiple)
                 k_cached = torch.zeros(padded_cache, HEAD_DIM, dtype=torch.bfloat16)
                 k_cached[:cache_len] = self.k_cache[layer_idx][h][:cache_len]
                 v_cached = torch.zeros(padded_cache, HEAD_DIM, dtype=torch.bfloat16)
                 v_cached[:cache_len] = self.v_cache[layer_idx][h][:cache_len]
+                k_all_list.append(k_cached)
+                v_all_list.append(v_cached)
 
-                # Upload
-                q_h_tt = to_ttnn(q_heads[h], device)      # (32, 128)
-                k_h_tt = to_ttnn(k_cached, device)          # (padded, 128)
-                v_h_tt = to_ttnn(v_cached, device)
-                sdpa_out_tt = to_ttnn(torch.zeros(TILE, HEAD_DIM, dtype=torch.bfloat16), device)
+            # Stack heads vertically: (n_head*padded_cache, 128), (n_head*32, 128)
+            q_all = q_normed_cpu  # already (n_head*32, 128)
+            k_all = torch.cat(k_all_list, dim=0)
+            v_all = torch.cat(v_all_list, dim=0)
 
-                sdpa_kernel(q_h_tt, k_h_tt, v_h_tt,
-                            self.scale_tt, self.scaler_tt, mask_tt, sdpa_out_tt)
+            # Single multi-head SDPA call (16 cores in parallel)
+            q_all_tt = to_ttnn(q_all, device)
+            k_all_tt = to_ttnn(k_all, device)
+            v_all_tt = to_ttnn(v_all, device)
+            sdpa_out_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+            sdpa_multihead(q_all_tt, k_all_tt, v_all_tt,
+                           self.scale_tt, self.scaler_tt, mask_tt, sdpa_out_tt)
 
-                attn_results.append(ttnn.to_torch(sdpa_out_tt))  # (32, 128)
-
-            # -- Concatenate heads -> (32, n_embd) --
-            attn_concat = torch.stack(attn_results, dim=1).view(TILE, n_embd)
+            # Reshape: (n_head*32, 128) -> (32, n_head, 128) -> (32, n_embd)
+            sdpa_result = ttnn.to_torch(sdpa_out_tt).view(n_head, TILE, HEAD_DIM)
+            attn_concat = sdpa_result.permute(1, 0, 2).contiguous().view(TILE, n_embd)
 
             # -- Output projection --
             attn_tt = to_ttnn(attn_concat, device)
