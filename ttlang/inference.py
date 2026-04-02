@@ -227,6 +227,70 @@ def make_linear_kernel(k_tiles):
 linear_kernel = make_linear_kernel(64)
 
 
+# -- Linear with column offset: out = x[:, col_off:col_off+k] @ w --
+# Used for MLP proj where we read slices of a wide tensor without readback.
+def make_linear_slice_kernel(k_tiles, col_offset_tiles):
+    @ttl.operation(grid="auto")
+    def linear_slice_kernel(x, w, out):
+        grid_cols, _ = ttl.grid_size(dims=2)
+        m_tiles = x.shape[0] // TILE
+        n_tiles = w.shape[1] // TILE
+        col_groups = n_tiles // NCOLS
+        total = m_tiles * col_groups
+        units_per_core = -(-total // grid_cols)
+
+        a_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_tiles), buffer_factor=2)
+        w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_tiles, NCOLS), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, NCOLS), buffer_factor=2)
+
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    a_blk = a_dfb.wait()
+                    w_blk = w_dfb.wait()
+                    with out_dfb.reserve() as o:
+                        o.store(a_blk @ w_blk)
+                    a_blk.pop()
+                    w_blk.pop()
+
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    mi = t // col_groups
+                    gi = t % col_groups
+                    sc = gi * NCOLS
+                    with a_dfb.reserve() as blk:
+                        tx = ttl.copy(x[mi, col_offset_tiles:col_offset_tiles + k_tiles], blk); tx.wait()
+                    with w_dfb.reserve() as blk:
+                        tx = ttl.copy(w[0:k_tiles, sc:sc + NCOLS], blk); tx.wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    mi = t // col_groups
+                    gi = t % col_groups
+                    sc = gi * NCOLS
+                    with out_dfb.wait() as blk:
+                        tx = ttl.copy(blk, out[mi, sc:sc + NCOLS]); tx.wait()
+
+    return linear_slice_kernel
+
+# MLP proj slice kernels: 4 chunks of K=64 tiles with different column offsets
+N_MLP_CHUNKS = 4
+mlp_proj_slice_kernels = [
+    make_linear_slice_kernel(K_CHUNK_MAX, c * K_CHUNK_MAX) for c in range(N_MLP_CHUNKS)
+]
+
+
 # -- Elementwise ReLU squared --
 @ttl.operation(grid="auto")
 def relu_sq_kernel(x, out):
@@ -372,6 +436,72 @@ def residual_add_kernel(x, y, out):
                 col = t % col_tiles
                 with out_dfb.wait() as blk:
                     tx = ttl.copy(blk, out[row, col]); tx.wait()
+
+
+# -- Reshape: interleaved heads -> batched heads --
+# Input: (TILE, n_head * HEAD_DIM) with heads interleaved in columns
+# Output: (n_head * TILE, HEAD_DIM) with heads stacked in rows
+@ttl.operation(grid=(SDPA_GRID_X, SDPA_GRID_Y))
+def reshape_to_heads(inp, out):
+    @ttl.compute()
+    def compute():
+        nx, ny = ttl.node(dims=2)
+        h = ny * SDPA_GRID_X + nx
+        for j in range(HEAD_TILES):
+            with inp_dfb.wait() as blk, out_dfb.reserve() as o:
+                o.store(blk)
+
+    inp_dfb = ttl.make_dataflow_buffer_like(inp, shape=(1, 1), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+
+    @ttl.datamovement()
+    def dm_read():
+        nx, ny = ttl.node(dims=2)
+        h = ny * SDPA_GRID_X + nx
+        for j in range(HEAD_TILES):
+            with inp_dfb.reserve() as blk:
+                tx = ttl.copy(inp[0, h * HEAD_TILES + j], blk); tx.wait()
+
+    @ttl.datamovement()
+    def dm_write():
+        nx, ny = ttl.node(dims=2)
+        h = ny * SDPA_GRID_X + nx
+        for j in range(HEAD_TILES):
+            with out_dfb.wait() as blk:
+                tx = ttl.copy(blk, out[h, j]); tx.wait()
+
+
+# -- Reshape: batched heads -> interleaved heads (reverse) --
+# Input: (n_head * TILE, HEAD_DIM) with heads stacked in rows
+# Output: (TILE, n_head * HEAD_DIM) with heads interleaved in columns
+@ttl.operation(grid=(SDPA_GRID_X, SDPA_GRID_Y))
+def reshape_from_heads(inp, out):
+    inp_dfb = ttl.make_dataflow_buffer_like(inp, shape=(1, 1), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+
+    @ttl.compute()
+    def compute():
+        nx, ny = ttl.node(dims=2)
+        h = ny * SDPA_GRID_X + nx
+        for j in range(HEAD_TILES):
+            with inp_dfb.wait() as blk, out_dfb.reserve() as o:
+                o.store(blk)
+
+    @ttl.datamovement()
+    def dm_read():
+        nx, ny = ttl.node(dims=2)
+        h = ny * SDPA_GRID_X + nx
+        for j in range(HEAD_TILES):
+            with inp_dfb.reserve() as blk:
+                tx = ttl.copy(inp[h, j], blk); tx.wait()
+
+    @ttl.datamovement()
+    def dm_write():
+        nx, ny = ttl.node(dims=2)
+        h = ny * SDPA_GRID_X + nx
+        for j in range(HEAD_TILES):
+            with out_dfb.wait() as blk:
+                tx = ttl.copy(blk, out[0, h * HEAD_TILES + j]); tx.wait()
 
 
 # -- Scaled residual: out = lr * x + l0 * x0 --
@@ -769,6 +899,42 @@ class NanochatModel:
                          for _ in range(self.n_head)] for _ in range(self.n_layer)]
         self.v_cache = [[torch.zeros(self.max_seq, HEAD_DIM, dtype=torch.bfloat16)
                          for _ in range(self.n_head)] for _ in range(self.n_layer)]
+
+        # Pre-allocated scratch tensors on device (reused every decode step)
+        n_embd = self.n_embd
+        n_head = self.n_head
+        mlp_dim = self.mlp_dim
+        self.x_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.normed_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.x0_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.temp_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.normed2_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.q_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.k_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.v_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.y_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.hidden_tt = to_ttnn(torch.zeros(TILE, mlp_dim, dtype=torch.bfloat16), device)
+        self.hidden_act_tt = to_ttnn(torch.zeros(TILE, mlp_dim, dtype=torch.bfloat16), device)
+        self.mlp_out_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.buf_a_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.partial_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+
+        # Batched head tensors (n_head * TILE, HEAD_DIM)
+        self.q_batch_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.k_batch_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.v_batch_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.q_rot_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.k_rot_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.q_norm_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.k_norm_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.sdpa_out_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.attn_concat_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+
+        # LM head scratch
+        lm_cols = self.lm_head_cols
+        self.logits_tt = to_ttnn(torch.zeros(TILE, lm_cols, dtype=torch.bfloat16), device)
+        self.logits_cap_tt = to_ttnn(torch.zeros(TILE, lm_cols, dtype=torch.bfloat16), device)
+
         print("  Model ready")
 
     def reset_cache(self):
@@ -804,30 +970,39 @@ class NanochatModel:
         n_head = self.n_head
         mlp_dim = self.mlp_dim
 
+        # Use pre-allocated scratch tensors
+        x_tt = self.x_tt
+        normed_tt = self.normed_tt
+        x0_tt = self.x0_tt
+        temp_tt = self.temp_tt
+        normed2_tt = self.normed2_tt
+        q_tt = self.q_tt
+        k_tt = self.k_tt
+        v_tt = self.v_tt
+        y_tt = self.y_tt
+        hidden_tt = self.hidden_tt
+        hidden_act_tt = self.hidden_act_tt
+        buf_a_tt = self.buf_a_tt
+        q_batch_tt = self.q_batch_tt
+        k_batch_tt = self.k_batch_tt
+        v_batch_tt = self.v_batch_tt
+        q_rot_tt = self.q_rot_tt
+        k_rot_tt = self.k_rot_tt
+        q_norm_tt = self.q_norm_tt
+        k_norm_tt = self.k_norm_tt
+        sdpa_out_tt = self.sdpa_out_tt
+        attn_concat_tt = self.attn_concat_tt
+
         # 1. Embedding lookup (CPU) -> pad to (32, n_embd)
         x_cpu = torch.zeros(TILE, n_embd, dtype=torch.bfloat16)
         x_cpu[0] = self.wte[token_id]
 
         # Upload and norm
         x_tt = to_ttnn(x_cpu, device)
-        normed_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
         self.rmsnorm_embd(x_tt, self.scaler_tt, self.ms_embd_tt, normed_tt)
-        # x0 = normed embedding (saved for residual blending)
-        x0_tt = normed_tt
-        # x starts as normed embedding
-        x_tt = to_ttnn(ttnn.to_torch(normed_tt), device)  # copy for separate buffer
-
-        # Pre-allocate working tensors
-        temp_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        normed2_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        q_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        k_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        v_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        y_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        hidden_tt = to_ttnn(torch.zeros(TILE, mlp_dim, dtype=torch.bfloat16), device)
-        hidden_act_tt = to_ttnn(torch.zeros(TILE, mlp_dim, dtype=torch.bfloat16), device)
-        mlp_out_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        buf_a_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        # x0 = normed (copy into x0 buffer), x = normed (copy into x buffer)
+        x0_tt = to_ttnn(ttnn.to_torch(normed_tt), device)  # TODO: device-side copy
+        x_tt = to_ttnn(ttnn.to_torch(normed_tt), device)   # TODO: device-side copy
 
         # Rotary: cos/sin for this position, replicated for all heads
         cos_row = self.rotary_cos[pos]  # (half_dim,) = (64,)
@@ -837,12 +1012,6 @@ class NanochatModel:
         cos_tt = to_ttnn(cos_batched, device)
         sin_tt = to_ttnn(sin_batched, device)
 
-        # Batched head working tensors
-        q_rot_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-        k_rot_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-        q_norm_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-        k_norm_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-
         # SDPA mask: (32, padded_cache_len)
         cache_len = pos + 1
         padded_cache = pad_to_tile(cache_len)
@@ -851,9 +1020,6 @@ class NanochatModel:
         if padded_cache > cache_len:
             mask_cpu[:, cache_len:] = -10000.0
         mask_tt = to_ttnn(mask_cpu, device)
-
-        # Multi-head SDPA output (all heads batched)
-        sdpa_out_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
 
         for layer_idx in range(self.n_layer):
             # -- Scaled residual: temp = lr*x + l0*x0 --
@@ -869,30 +1035,25 @@ class NanochatModel:
             linear_kernel(normed_tt, self.w_k[layer_idx], k_tt)
             linear_kernel(normed_tt, self.w_v[layer_idx], v_tt)
 
-            # -- Read back to CPU for head processing --
-            q_cpu = ttnn.to_torch(q_tt)    # (32, 2048)
-            k_cpu = ttnn.to_torch(k_tt)
-            v_cpu = ttnn.to_torch(v_tt)
+            # -- Reshape Q, K, V to head-batched on device --
+            reshape_to_heads(q_tt, q_batch_tt)
+            reshape_to_heads(k_tt, k_batch_tt)
 
-            # -- Value embedding (CPU) --
+            # -- Value embedding (CPU readback only for VE layers) --
             if self.value_embed[layer_idx] is not None:
+                v_cpu = ttnn.to_torch(v_tt)
                 normed_cpu = ttnn.to_torch(normed_tt)
-                gate_in = normed_cpu[0:1, :12].float()  # (1, 12)
-                ve_gate_w = self.ve_gate[layer_idx].float()  # (n_kv_head, 12)
-                gate = 3.0 * torch.sigmoid(gate_in @ ve_gate_w.t())  # (1, n_kv_head)
-                ve_val = self.value_embed[layer_idx][token_id]  # (kv_dim,) bf16
+                gate_in = normed_cpu[0:1, :12].float()
+                ve_gate_w = self.ve_gate[layer_idx].float()
+                gate = 3.0 * torch.sigmoid(gate_in @ ve_gate_w.t())
+                ve_val = self.value_embed[layer_idx][token_id]
                 for h in range(n_head):
                     s = h * HEAD_DIM
                     e = s + HEAD_DIM
                     v_cpu[0, s:e] += gate[0, h].to(torch.bfloat16) * ve_val[s:e]
+                v_tt = to_ttnn(v_cpu, device)
 
-            # -- Reshape to head-batched --
-            q_batch = q_cpu.view(TILE, n_head, HEAD_DIM).permute(1, 0, 2).contiguous().view(TILE * n_head, HEAD_DIM)
-            k_batch = k_cpu.view(TILE, n_head, HEAD_DIM).permute(1, 0, 2).contiguous().view(TILE * n_head, HEAD_DIM)
-
-            # Upload batched tensors
-            q_batch_tt = to_ttnn(q_batch, device)
-            k_batch_tt = to_ttnn(k_batch, device)
+            reshape_to_heads(v_tt, v_batch_tt)
 
             # -- Rotary (one call for all heads) --
             rotary_kernel(q_batch_tt, cos_tt, sin_tt, q_rot_tt)
@@ -902,22 +1063,17 @@ class NanochatModel:
             rmsnorm_head(q_rot_tt, self.scaler_tt, self.ms_head_tt, q_norm_tt)
             rmsnorm_head(k_rot_tt, self.scaler_tt, self.ms_head_tt, k_norm_tt)
 
-            # -- Read back normed Q, K and split into heads --
-            q_normed_cpu = ttnn.to_torch(q_norm_tt)  # (n_head*32, 128)
-            k_normed_cpu = ttnn.to_torch(k_norm_tt)
-            q_heads = q_normed_cpu.view(n_head, TILE, HEAD_DIM)
+            # -- KV cache update (still CPU for now) --
+            k_normed_cpu = ttnn.to_torch(k_norm_tt)  # (n_head*32, 128)
+            v_batch_cpu = ttnn.to_torch(v_batch_tt)   # (n_head*32, 128)
             k_heads = k_normed_cpu.view(n_head, TILE, HEAD_DIM)
+            v_heads = v_batch_cpu.view(n_head, TILE, HEAD_DIM)
 
-            # V heads (already on CPU, not batched through rotary/norm)
-            v_heads = v_cpu.view(TILE, n_head, HEAD_DIM).permute(1, 0, 2).contiguous()
-
-            # -- Update KV cache and build batched K/V for all heads --
             k_all_list = []
             v_all_list = []
             for h in range(n_head):
                 self.k_cache[layer_idx][h][pos] = k_heads[h, 0]
                 self.v_cache[layer_idx][h][pos] = v_heads[h, 0]
-
                 k_cached = torch.zeros(padded_cache, HEAD_DIM, dtype=torch.bfloat16)
                 k_cached[:cache_len] = self.k_cache[layer_idx][h][:cache_len]
                 v_cached = torch.zeros(padded_cache, HEAD_DIM, dtype=torch.bfloat16)
@@ -925,28 +1081,20 @@ class NanochatModel:
                 k_all_list.append(k_cached)
                 v_all_list.append(v_cached)
 
-            # Stack heads vertically: (n_head*padded_cache, 128), (n_head*32, 128)
-            q_all = q_normed_cpu  # already (n_head*32, 128)
-            k_all = torch.cat(k_all_list, dim=0)
-            v_all = torch.cat(v_all_list, dim=0)
+            k_all_tt = to_ttnn(torch.cat(k_all_list, dim=0), device)
+            v_all_tt = to_ttnn(torch.cat(v_all_list, dim=0), device)
 
-            # Single multi-head SDPA call (16 cores in parallel)
-            q_all_tt = to_ttnn(q_all, device)
-            k_all_tt = to_ttnn(k_all, device)
-            v_all_tt = to_ttnn(v_all, device)
-            sdpa_out_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-            flash_attention(q_all_tt, k_all_tt, v_all_tt,
+            # -- Flash attention (Q already in q_norm_tt, batched) --
+            flash_attention(q_norm_tt, k_all_tt, v_all_tt,
                            self.scale_tt, self.scaler_tt,
                            self.ninf_tt, self.zero_tt, self.zero_head_tt,
                            mask_tt, sdpa_out_tt)
 
-            # Reshape: (n_head*32, 128) -> (32, n_head, 128) -> (32, n_embd)
-            sdpa_result = ttnn.to_torch(sdpa_out_tt).view(n_head, TILE, HEAD_DIM)
-            attn_concat = sdpa_result.permute(1, 0, 2).contiguous().view(TILE, n_embd)
+            # -- Reshape SDPA output back to interleaved --
+            reshape_from_heads(sdpa_out_tt, attn_concat_tt)
 
             # -- Output projection --
-            attn_tt = to_ttnn(attn_concat, device)
-            linear_kernel(attn_tt, self.w_proj[layer_idx], y_tt)
+            linear_kernel(attn_concat_tt, self.w_proj[layer_idx], y_tt)
 
             # -- Residual: buf_a = temp + y --
             residual_add_kernel(temp_tt, y_tt, buf_a_tt)
@@ -957,40 +1105,32 @@ class NanochatModel:
             # -- MLP: fc -> relu^2 -> proj (chunked along K for proj) --
             linear_kernel(normed2_tt, self.w_fc[layer_idx], hidden_tt)
             relu_sq_kernel(hidden_tt, hidden_act_tt)
-            # MLP proj is chunked: hidden_act(32, 8192) split into 4x(32, 2048) chunks
-            hidden_act_cpu = ttnn.to_torch(hidden_act_tt)  # (32, 8192)
-            chunk_size = K_CHUNK_MAX * TILE  # 2048
+            # MLP proj: hidden_act(32, 8192) @ w_proj chunked along K dim
+            # Each slice kernel reads a different K-range of hidden_act_tt
+            # Accumulate using ping-pong between self.mlp_out_tt and self.partial_tt
             chunks = self.w_mlp_proj[layer_idx]
-            partial_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-            mlp_out_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-            for c_idx, w_chunk in enumerate(chunks):
-                x_chunk = hidden_act_cpu[:, c_idx * chunk_size:(c_idx + 1) * chunk_size].contiguous()
-                x_chunk_tt = to_ttnn(x_chunk, device)
-                linear_kernel(x_chunk_tt, w_chunk, partial_tt)
-                if c_idx == 0:
-                    mlp_out_tt = to_ttnn(ttnn.to_torch(partial_tt), device)
-                else:
-                    new_mlp_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-                    residual_add_kernel(mlp_out_tt, partial_tt, new_mlp_tt)
-                    mlp_out_tt = new_mlp_tt
+            acc_a, acc_b = self.mlp_out_tt, self.partial_tt
+            mlp_proj_slice_kernels[0](hidden_act_tt, chunks[0], acc_a)
+            for c_idx in range(1, len(chunks)):
+                # Use y_tt as temp for slice output (free here, after output proj consumed it)
+                mlp_proj_slice_kernels[c_idx](hidden_act_tt, chunks[c_idx], normed2_tt)
+                residual_add_kernel(acc_a, normed2_tt, acc_b)
+                acc_a, acc_b = acc_b, acc_a
 
             # -- Residual: x = buf_a + mlp_out --
-            residual_add_kernel(buf_a_tt, mlp_out_tt, x_tt)
+            residual_add_kernel(buf_a_tt, acc_a, x_tt)
 
         # -- Final norm --
         self.rmsnorm_embd(x_tt, self.scaler_tt, self.ms_embd_tt, normed_tt)
 
         # -- LM head --
-        lm_cols = self.lm_head_cols
-        logits_tt = to_ttnn(torch.zeros(TILE, lm_cols, dtype=torch.bfloat16), device)
-        linear_kernel(normed_tt, self.lm_head, logits_tt)
+        linear_kernel(normed_tt, self.lm_head, self.logits_tt)
 
         # -- Softcap --
-        logits_cap_tt = to_ttnn(torch.zeros(TILE, lm_cols, dtype=torch.bfloat16), device)
-        softcap_kernel(logits_tt, self.inv_cap_tt, self.cap_tt, logits_cap_tt)
+        softcap_kernel(self.logits_tt, self.inv_cap_tt, self.cap_tt, self.logits_cap_tt)
 
         # -- Read back logits (only row 0, crop to vocab_size) --
-        logits_cpu = ttnn.to_torch(logits_cap_tt)  # (32, padded_vocab)
+        logits_cpu = ttnn.to_torch(self.logits_cap_tt)  # (32, padded_vocab)
         logits = logits_cpu[0, :self.vocab_size].float()  # (vocab_size,) float32
 
         return logits
