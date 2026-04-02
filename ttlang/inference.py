@@ -917,10 +917,14 @@ class NanochatModel:
         self.wte = state["transformer.wte.weight"].to(torch.bfloat16)
         print(f"  wte: {self.wte.shape}")
 
-        # Rotary embeddings
+        # Rotary embeddings: precompute expanded table on device
+        # Each position gets TILE identical rows so ttnn.slice gives a ready tile
         cos, sin = precompute_rotary(seq_len * 10, HEAD_DIM)
-        self.rotary_cos = cos
-        self.rotary_sin = sin
+        cos_expanded = cos[:seq_len].unsqueeze(1).expand(-1, TILE, -1).reshape(seq_len * TILE, HALF_DIM)
+        sin_expanded = sin[:seq_len].unsqueeze(1).expand(-1, TILE, -1).reshape(seq_len * TILE, HALF_DIM)
+        self.cos_table_tt = to_ttnn(cos_expanded.contiguous(), device)
+        self.sin_table_tt = to_ttnn(sin_expanded.contiguous(), device)
+        print(f"  Rotary tables: ({seq_len * TILE}, {HALF_DIM}) on device")
 
         # Per-layer scalars -> constant tiles on device
         resid_lambdas = state["resid_lambdas"].float()
@@ -999,6 +1003,16 @@ class NanochatModel:
         self.zero_tt = to_ttnn_l1(torch.zeros(TILE, TILE, dtype=torch.bfloat16), device)
         self.zero_head_tt = to_ttnn_l1(torch.zeros(TILE, HEAD_DIM, dtype=torch.bfloat16), device)
         self.three_tt = to_ttnn(torch.full((TILE, TILE), 3.0, dtype=torch.bfloat16), device)
+
+        # Precomputed SDPA masks: (max_seq, TILE, padded_seq) on device
+        padded_seq = pad_to_tile(self.max_seq)
+        self.padded_seq = padded_seq
+        all_masks = torch.full((self.max_seq, TILE, padded_seq), -10000.0, dtype=torch.bfloat16)
+        for p in range(self.max_seq):
+            all_masks[p, :, :p + 1] = 0.0
+        self.all_masks_tt = to_ttnn(all_masks.contiguous(), device)
+        mask_mb = self.max_seq * TILE * padded_seq * 2 / 1e6
+        print(f"  SDPA masks: ({self.max_seq}, {TILE}, {padded_seq}) = {mask_mb:.0f}MB on device")
 
         # KV cache on device using ttnn.update_cache
         # Shape: (1, n_head, max_seq, HEAD_DIM) per layer -- standard TTNN KV cache layout
@@ -1127,20 +1141,17 @@ class NanochatModel:
         copy_kernel(normed_tt, x0_tt)
         copy_kernel(normed_tt, x_tt)
 
-        # Rotary: cos/sin for this position, replicated for all heads
-        cos_row = self.rotary_cos[pos]  # (half_dim,) = (64,)
-        sin_row = self.rotary_sin[pos]
-        cos_batched = cos_row.unsqueeze(0).expand(TILE * n_head, -1).contiguous()
-        sin_batched = sin_row.unsqueeze(0).expand(TILE * n_head, -1).contiguous()
-        cos_tt = to_ttnn(cos_batched, device)
-        sin_tt = to_ttnn(sin_batched, device)
+        # Rotary: slice from precomputed table, repeat for all heads
+        rot_start = pos * TILE
+        cos_pos = ttnn.slice(self.cos_table_tt, [rot_start, 0], [rot_start + TILE, HALF_DIM])
+        sin_pos = ttnn.slice(self.sin_table_tt, [rot_start, 0], [rot_start + TILE, HALF_DIM])
+        cos_tt = ttnn.repeat(cos_pos, ttnn.Shape([n_head, 1]))
+        sin_tt = ttnn.repeat(sin_pos, ttnn.Shape([n_head, 1]))
 
-        # SDPA mask: (TILE, padded_seq) -- mask out unused cache positions
+        # SDPA mask: slice from precomputed masks on device
         padded_seq = self.padded_seq
-        cache_len = pos + 1
-        mask_cpu = torch.full((TILE, padded_seq), -10000.0, dtype=torch.bfloat16)
-        mask_cpu[:, :cache_len] = 0.0
-        mask_tt = to_ttnn(mask_cpu, device)
+        mask_3d = ttnn.slice(self.all_masks_tt, [pos, 0, 0], [pos + 1, TILE, padded_seq])
+        mask_tt = ttnn.reshape(mask_3d, (TILE, padded_seq))
 
         for layer_idx in range(self.n_layer):
             # -- Scaled residual: temp = lr*x + l0*x0 --
