@@ -364,6 +364,80 @@ mlp_proj_slice_kernels = [
 ]
 
 
+# -- Fused MLP proj: accumulates partial matmuls across K-chunks in L1 --
+# out = sum_c(x[:, c*k_chunk:(c+1)*k_chunk] @ w[c*k_chunk:(c+1)*k_chunk, :])
+# Replaces N_MLP_CHUNKS separate slice kernels + (N_MLP_CHUNKS-1) residual adds.
+@ttl.operation(grid="auto")
+def fused_mlp_proj_kernel(x, w, out):
+    k_chunk = K_CHUNK_MAX
+    grid_cols, _ = ttl.grid_size(dims=2)
+    m_tiles = x.shape[0] // TILE
+    n_tiles = w.shape[1] // TILE
+    col_groups = n_tiles // NCOLS
+    total = m_tiles * col_groups
+    units_per_core = -(-total // grid_cols)
+
+    x_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_chunk), buffer_factor=2)
+    w_dfb = ttl.make_dataflow_buffer_like(w, shape=(k_chunk, NCOLS), buffer_factor=2)
+    acc_a_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, NCOLS), buffer_factor=1)
+    partial_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, NCOLS), buffer_factor=1)
+    acc_b_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, NCOLS), buffer_factor=1)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, NCOLS), buffer_factor=1)
+
+    @ttl.compute()
+    def compute():
+        core_x, _ = ttl.node(dims=2)
+        for local_t in range(units_per_core):
+            t = core_x * units_per_core + local_t
+            if t < total:
+                # Chunk 0: matmul -> acc_a
+                with x_dfb.wait() as xb, w_dfb.wait() as wb, acc_a_dfb.reserve() as acc:
+                    acc.store(xb @ wb)
+                # Chunk 1: matmul -> partial, acc_a + partial -> acc_b
+                with x_dfb.wait() as xb, w_dfb.wait() as wb, partial_dfb.reserve() as p:
+                    p.store(xb @ wb)
+                with acc_a_dfb.wait() as a, partial_dfb.wait() as p, acc_b_dfb.reserve() as b:
+                    b.store(a + p)
+                # Chunk 2: matmul -> partial, acc_b + partial -> acc_a
+                with x_dfb.wait() as xb, w_dfb.wait() as wb, partial_dfb.reserve() as p:
+                    p.store(xb @ wb)
+                with acc_b_dfb.wait() as b, partial_dfb.wait() as p, acc_a_dfb.reserve() as a:
+                    a.store(b + p)
+                # Chunk 3: matmul -> partial, acc_a + partial -> out
+                with x_dfb.wait() as xb, w_dfb.wait() as wb, partial_dfb.reserve() as p:
+                    p.store(xb @ wb)
+                with acc_a_dfb.wait() as a, partial_dfb.wait() as p, out_dfb.reserve() as o:
+                    o.store(a + p)
+
+    @ttl.datamovement()
+    def dm_read():
+        core_x, _ = ttl.node(dims=2)
+        for local_t in range(units_per_core):
+            t = core_x * units_per_core + local_t
+            if t < total:
+                mi = t // col_groups
+                gi = t % col_groups
+                sc = gi * NCOLS
+                for c in range(N_MLP_CHUNKS):
+                    k_off = c * k_chunk
+                    with x_dfb.reserve() as b1, w_dfb.reserve() as b2:
+                        tx1 = ttl.copy(x[mi, k_off:k_off + k_chunk], b1)
+                        tx2 = ttl.copy(w[k_off:k_off + k_chunk, sc:sc + NCOLS], b2)
+                        tx1.wait(); tx2.wait()
+
+    @ttl.datamovement()
+    def dm_write():
+        core_x, _ = ttl.node(dims=2)
+        for local_t in range(units_per_core):
+            t = core_x * units_per_core + local_t
+            if t < total:
+                mi = t // col_groups
+                gi = t % col_groups
+                sc = gi * NCOLS
+                with out_dfb.wait() as blk:
+                    tx = ttl.copy(blk, out[mi, sc:sc + NCOLS]); tx.wait()
+
+
 # -- Elementwise ReLU squared --
 @ttl.operation(grid="auto")
 def relu_sq_kernel(x, out):
@@ -1015,17 +1089,9 @@ class NanochatModel:
             self.w_v.append(to_ttnn(state[f"{prefix}.attn.c_v.weight"].to(torch.bfloat16).t().contiguous(), device))
             self.w_proj.append(to_ttnn(state[f"{prefix}.attn.c_proj.weight"].to(torch.bfloat16).t().contiguous(), device))
             self.w_fc.append(to_ttnn(state[f"{prefix}.mlp.c_fc.weight"].to(torch.bfloat16).t().contiguous(), device))
-            # MLP proj: (8192, 2048) has k_tiles=256 which exceeds L1.
-            # Split into chunks of (2048, 2048) along K dimension.
+            # MLP proj: full (8192, 2048) weight in DRAM, fused kernel handles K-chunking
             mlp_proj_full = state[f"{prefix}.mlp.c_proj.weight"].to(torch.bfloat16).t().contiguous()  # (8192, 2048)
-            k_total = mlp_proj_full.shape[0]
-            chunk_size = K_CHUNK_MAX * TILE  # 2048
-            n_chunks = k_total // chunk_size
-            mlp_proj_chunks = []
-            for c in range(n_chunks):
-                chunk = mlp_proj_full[c * chunk_size:(c + 1) * chunk_size, :]
-                mlp_proj_chunks.append(to_ttnn(chunk, device))
-            self.w_mlp_proj.append(mlp_proj_chunks)
+            self.w_mlp_proj.append(to_ttnn(mlp_proj_full, device))
 
             # Value embedding: expanded gate weights and embedding table on device
             ve_gate_key = f"{prefix}.attn.ve_gate.weight"
@@ -1282,20 +1348,11 @@ class NanochatModel:
             # -- MLP: fc -> relu^2 -> proj (chunked along K for proj) --
             linear_kernel(normed2_tt, self.w_fc[layer_idx], hidden_tt)
             relu_sq_kernel(hidden_tt, hidden_act_tt)
-            # MLP proj: hidden_act(32, 8192) @ w_proj chunked along K dim
-            # Each slice kernel reads a different K-range of hidden_act_tt
-            # Accumulate using ping-pong between self.mlp_out_tt and self.partial_tt
-            chunks = self.w_mlp_proj[layer_idx]
-            acc_a, acc_b = self.mlp_out_tt, self.partial_tt
-            mlp_proj_slice_kernels[0](hidden_act_tt, chunks[0], acc_a)
-            for c_idx in range(1, len(chunks)):
-                # Use y_tt as temp for slice output (free here, after output proj consumed it)
-                mlp_proj_slice_kernels[c_idx](hidden_act_tt, chunks[c_idx], normed2_tt)
-                residual_add_kernel(acc_a, normed2_tt, acc_b)
-                acc_a, acc_b = acc_b, acc_a
+            # MLP proj: fused kernel accumulates 4 K-chunks in L1
+            fused_mlp_proj_kernel(hidden_act_tt, self.w_mlp_proj[layer_idx], self.mlp_out_tt)
 
             # -- Residual: x = buf_a + mlp_out --
-            residual_add_kernel(buf_a_tt, acc_a, x_tt)
+            residual_add_kernel(buf_a_tt, self.mlp_out_tt, x_tt)
 
         # -- Final norm --
         self.rmsnorm_embd(x_tt, self.scaler_tt, self.ms_embd_tt, normed_tt)
