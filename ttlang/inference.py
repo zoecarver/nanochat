@@ -504,6 +504,51 @@ def reshape_from_heads(inp, out):
                 tx = ttl.copy(blk, out[0, h * HEAD_TILES + j]); tx.wait()
 
 
+
+# -- Device-side tensor copy --
+@ttl.operation(grid="auto")
+def copy_kernel(inp, out):
+    grid_cols, _ = ttl.grid_size(dims=2)
+    row_tiles = inp.shape[0] // TILE
+    col_tiles = inp.shape[1] // TILE
+    total_tiles = row_tiles * col_tiles
+    tiles_per_core = -(-total_tiles // grid_cols)
+
+    inp_dfb = ttl.make_dataflow_buffer_like(inp, shape=(1, 1), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+
+    @ttl.compute()
+    def compute():
+        core_x, _ = ttl.node(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total_tiles:
+                with inp_dfb.wait() as blk, out_dfb.reserve() as o:
+                    o.store(blk)
+
+    @ttl.datamovement()
+    def dm_read():
+        core_x, _ = ttl.node(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total_tiles:
+                row = t // col_tiles
+                col = t % col_tiles
+                with inp_dfb.reserve() as blk:
+                    tx = ttl.copy(inp[row, col], blk); tx.wait()
+
+    @ttl.datamovement()
+    def dm_write():
+        core_x, _ = ttl.node(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < total_tiles:
+                row = t // col_tiles
+                col = t % col_tiles
+                with out_dfb.wait() as blk:
+                    tx = ttl.copy(blk, out[row, col]); tx.wait()
+
+
 # -- Scaled residual: out = lr * x + l0 * x0 --
 @ttl.operation(grid="auto")
 def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
@@ -894,11 +939,19 @@ class NanochatModel:
         self.zero_tt = to_ttnn_l1(torch.zeros(TILE, TILE, dtype=torch.bfloat16), device)
         self.zero_head_tt = to_ttnn_l1(torch.zeros(TILE, HEAD_DIM, dtype=torch.bfloat16), device)
 
-        # KV cache: per layer, per head, on CPU
-        self.k_cache = [[torch.zeros(self.max_seq, HEAD_DIM, dtype=torch.bfloat16)
-                         for _ in range(self.n_head)] for _ in range(self.n_layer)]
-        self.v_cache = [[torch.zeros(self.max_seq, HEAD_DIM, dtype=torch.bfloat16)
-                         for _ in range(self.n_head)] for _ in range(self.n_layer)]
+        # KV cache on device using ttnn.update_cache
+        # Shape: (1, n_head, max_seq, HEAD_DIM) per layer -- standard TTNN KV cache layout
+        padded_seq = pad_to_tile(self.max_seq)
+        self.padded_seq = padded_seq
+        self.k_cache = []
+        self.v_cache = []
+        for i in range(self.n_layer):
+            self.k_cache.append(to_ttnn(
+                torch.zeros(1, self.n_head, padded_seq, HEAD_DIM, dtype=torch.bfloat16), device))
+            self.v_cache.append(to_ttnn(
+                torch.zeros(1, self.n_head, padded_seq, HEAD_DIM, dtype=torch.bfloat16), device))
+        cache_mb = self.n_layer * 2 * self.n_head * padded_seq * HEAD_DIM * 2 / 1e6
+        print(f"  KV cache: {self.n_layer} layers x 2 x (1, {self.n_head}, {padded_seq}, {HEAD_DIM}) = {cache_mb:.0f}MB")
 
         # Pre-allocated scratch tensors on device (reused every decode step)
         n_embd = self.n_embd
@@ -938,10 +991,12 @@ class NanochatModel:
         print("  Model ready")
 
     def reset_cache(self):
+        padded_seq = self.padded_seq
         for layer in range(self.n_layer):
-            for head in range(self.n_head):
-                self.k_cache[layer][head].zero_()
-                self.v_cache[layer][head].zero_()
+            self.k_cache[layer] = to_ttnn(
+                torch.zeros(1, self.n_head, padded_seq, HEAD_DIM, dtype=torch.bfloat16), self.device)
+            self.v_cache[layer] = to_ttnn(
+                torch.zeros(1, self.n_head, padded_seq, HEAD_DIM, dtype=torch.bfloat16), self.device)
 
     def encode(self, text):
         if self.tokenizer is None:
@@ -1000,9 +1055,9 @@ class NanochatModel:
         # Upload and norm
         x_tt = to_ttnn(x_cpu, device)
         self.rmsnorm_embd(x_tt, self.scaler_tt, self.ms_embd_tt, normed_tt)
-        # x0 = normed (copy into x0 buffer), x = normed (copy into x buffer)
-        x0_tt = to_ttnn(ttnn.to_torch(normed_tt), device)  # TODO: device-side copy
-        x_tt = to_ttnn(ttnn.to_torch(normed_tt), device)   # TODO: device-side copy
+        # x0 = normed (copy on device), x = normed (copy on device)
+        copy_kernel(normed_tt, x0_tt)
+        copy_kernel(normed_tt, x_tt)
 
         # Rotary: cos/sin for this position, replicated for all heads
         cos_row = self.rotary_cos[pos]  # (half_dim,) = (64,)
@@ -1012,13 +1067,11 @@ class NanochatModel:
         cos_tt = to_ttnn(cos_batched, device)
         sin_tt = to_ttnn(sin_batched, device)
 
-        # SDPA mask: (32, padded_cache_len)
+        # SDPA mask: (TILE, padded_seq) -- mask out unused cache positions
+        padded_seq = self.padded_seq
         cache_len = pos + 1
-        padded_cache = pad_to_tile(cache_len)
-
-        mask_cpu = torch.zeros(TILE, padded_cache, dtype=torch.bfloat16)
-        if padded_cache > cache_len:
-            mask_cpu[:, cache_len:] = -10000.0
+        mask_cpu = torch.full((TILE, padded_seq), -10000.0, dtype=torch.bfloat16)
+        mask_cpu[:, :cache_len] = 0.0
         mask_tt = to_ttnn(mask_cpu, device)
 
         for layer_idx in range(self.n_layer):
@@ -1063,29 +1116,16 @@ class NanochatModel:
             rmsnorm_head(q_rot_tt, self.scaler_tt, self.ms_head_tt, q_norm_tt)
             rmsnorm_head(k_rot_tt, self.scaler_tt, self.ms_head_tt, k_norm_tt)
 
-            # -- KV cache update (still CPU for now) --
-            k_normed_cpu = ttnn.to_torch(k_norm_tt)  # (n_head*32, 128)
-            v_batch_cpu = ttnn.to_torch(v_batch_tt)   # (n_head*32, 128)
-            k_heads = k_normed_cpu.view(n_head, TILE, HEAD_DIM)
-            v_heads = v_batch_cpu.view(n_head, TILE, HEAD_DIM)
+            # -- KV cache update on device via ttnn.update_cache --
+            k_norm_4d = ttnn.reshape(k_norm_tt, (1, n_head, TILE, HEAD_DIM))
+            v_batch_4d = ttnn.reshape(v_batch_tt, (1, n_head, TILE, HEAD_DIM))
+            ttnn.kv_cache.update_cache_for_token_(self.k_cache[layer_idx], k_norm_4d, pos, 0)
+            ttnn.kv_cache.update_cache_for_token_(self.v_cache[layer_idx], v_batch_4d, pos, 0)
 
-            k_all_list = []
-            v_all_list = []
-            for h in range(n_head):
-                self.k_cache[layer_idx][h][pos] = k_heads[h, 0]
-                self.v_cache[layer_idx][h][pos] = v_heads[h, 0]
-                k_cached = torch.zeros(padded_cache, HEAD_DIM, dtype=torch.bfloat16)
-                k_cached[:cache_len] = self.k_cache[layer_idx][h][:cache_len]
-                v_cached = torch.zeros(padded_cache, HEAD_DIM, dtype=torch.bfloat16)
-                v_cached[:cache_len] = self.v_cache[layer_idx][h][:cache_len]
-                k_all_list.append(k_cached)
-                v_all_list.append(v_cached)
-
-            k_all_tt = to_ttnn(torch.cat(k_all_list, dim=0), device)
-            v_all_tt = to_ttnn(torch.cat(v_all_list, dim=0), device)
-
-            # -- Flash attention (Q already in q_norm_tt, batched) --
-            flash_attention(q_norm_tt, k_all_tt, v_all_tt,
+            # -- Flash attention (reshape cache to 2D for flash kernel) --
+            k_cache_2d = ttnn.reshape(self.k_cache[layer_idx], (n_head * padded_seq, HEAD_DIM))
+            v_cache_2d = ttnn.reshape(self.v_cache[layer_idx], (n_head * padded_seq, HEAD_DIM))
+            flash_attention(q_norm_tt, k_cache_2d, v_cache_2d,
                            self.scale_tt, self.scaler_tt,
                            self.ninf_tt, self.zero_tt, self.zero_head_tt,
                            mask_tt, sdpa_out_tt)
