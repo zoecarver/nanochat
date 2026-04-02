@@ -915,9 +915,9 @@ class NanochatModel:
         # RMSNorm kernel for this embedding width
         self.rmsnorm_embd = make_rmsnorm_kernel(self.n_embd)
 
-        # Embeddings (stay on CPU for lookup)
-        self.wte = state["transformer.wte.weight"].to(torch.bfloat16)
-        print(f"  wte: {self.wte.shape}")
+        # Embeddings on device for ttnn.embedding lookup
+        self.wte_tt = to_ttnn(state["transformer.wte.weight"].to(torch.bfloat16), device)
+        print(f"  wte: {state['transformer.wte.weight'].shape} on device")
 
         # Rotary embeddings: precompute expanded table on device
         # Each position gets TILE identical rows so ttnn.slice gives a ready tile
@@ -1127,17 +1127,14 @@ class NanochatModel:
         sdpa_out_tt = self.sdpa_out_tt
         attn_concat_tt = self.attn_concat_tt
 
-        # 1. Embedding lookup (CPU) -> pad to (32, n_embd)
-        x_cpu = torch.zeros(TILE, n_embd, dtype=torch.bfloat16)
-        x_cpu[0] = self.wte[token_id]
-
-        # Token ID on device for VE embedding lookups
+        # 1. Token ID -> device, embedding lookup on device
         token_id_tt = ttnn.from_torch(
             torch.tensor([[token_id]], dtype=torch.uint32),
             device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-
-        # Upload and norm
-        x_tt = to_ttnn(x_cpu, device)
+        wte_raw = ttnn.embedding(token_id_tt, self.wte_tt)  # (1, 1, n_embd) TILE
+        # Pad to (1, TILE, n_embd), then reshape to (TILE, n_embd)
+        wte_padded = ttnn.pad(wte_raw, padding=((0, 0), (0, TILE - 1), (0, 0)), value=0.0)
+        x_tt = ttnn.reshape(wte_padded, (TILE, n_embd))
         self.rmsnorm_embd(x_tt, self.scaler_tt, self.ms_embd_tt, normed_tt)
         # x0 = normed (copy on device), x = normed (copy on device)
         copy_kernel(normed_tt, x0_tt)
@@ -1246,11 +1243,8 @@ class NanochatModel:
         # -- Softcap --
         softcap_kernel(self.logits_tt, self.inv_cap_tt, self.cap_tt, self.logits_cap_tt)
 
-        # -- Read back logits (only row 0, crop to vocab_size) --
-        logits_cpu = ttnn.to_torch(self.logits_cap_tt)  # (32, padded_vocab)
-        logits = logits_cpu[0, :self.vocab_size].float()  # (vocab_size,) float32
-
-        return logits
+        # Return logits on device -- sampling handles readback
+        return self.logits_cap_tt
 
 
 def generate(model, prompt_tokens, max_tokens=64, temperature=0.8, top_k=50, seed=42):
@@ -1270,15 +1264,21 @@ def generate(model, prompt_tokens, max_tokens=64, temperature=0.8, top_k=50, see
 
         pos = step
         t0 = time.time()
-        logits = model.decode_step(token_id, pos)
+        logits_tt = model.decode_step(token_id, pos)
         dt = time.time() - t0
 
         if step >= len(prompt_tokens) - 1:
             # Sample next token
             if temperature == 0:
-                next_token = torch.argmax(logits).item()
+                # Greedy: argmax on device, read back one int
+                argmax_tt = ttnn.argmax(logits_tt, dim=-1)
+                argmax_cpu = ttnn.to_torch(argmax_tt)
+                next_token = argmax_cpu.flatten()[0].item()
             else:
-                logits_scaled = logits / temperature
+                # Sampling: read back row 0 for CPU-side top-k + multinomial
+                logits_row0 = ttnn.slice(logits_tt, [0, 0], [1, model.vocab_size])
+                logits_cpu = ttnn.to_torch(logits_row0).float().squeeze(0)
+                logits_scaled = logits_cpu / temperature
                 if top_k > 0:
                     v, _ = torch.topk(logits_scaled, min(top_k, logits_scaled.shape[0]))
                     logits_scaled[logits_scaled < v[-1]] = -float("inf")
@@ -1318,7 +1318,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default="The chemical formula of water is",
                         help="Input prompt")
     parser.add_argument("--max-tokens", type=int, default=64, help="Max tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0=greedy)")
     parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
