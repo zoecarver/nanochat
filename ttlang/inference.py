@@ -225,6 +225,8 @@ def make_linear_kernel(k_tiles):
 
 # Standard linear for nanochat projections (K=64 for 2048-wide inputs)
 linear_kernel = make_linear_kernel(64)
+# Gate matmul for value embeddings: k=1 tile (reads first 32 cols of input)
+linear_kernel_k1 = make_linear_kernel(1)
 
 
 # -- Linear with column offset: out = x[:, col_off:col_off+k] @ w --
@@ -503,6 +505,56 @@ def reshape_from_heads(inp, out):
             with out_dfb.wait() as blk:
                 tx = ttl.copy(blk, out[0, h * HEAD_TILES + j]); tx.wait()
 
+
+# -- Value embedding gated add: out = v + 3 * sigmoid(gate_logits) * ve_val --
+# gate_logits: (TILE, n_embd) from expanded gate matmul
+# ve_val: (TILE, n_embd) from embedding lookup (padded)
+# v, out: (TILE, n_embd)
+@ttl.operation(grid="auto")
+def ve_gated_add_kernel(v, gate_logits, ve_val, three_tile, out):
+    grid_cols, _ = ttl.grid_size(dims=2)
+    col_tiles = v.shape[1] // TILE
+    tiles_per_core = -(-col_tiles // grid_cols)
+
+    v_dfb = ttl.make_dataflow_buffer_like(v, shape=(1, 1), buffer_factor=2)
+    g_dfb = ttl.make_dataflow_buffer_like(gate_logits, shape=(1, 1), buffer_factor=2)
+    ve_dfb = ttl.make_dataflow_buffer_like(ve_val, shape=(1, 1), buffer_factor=2)
+    thr_dfb = ttl.make_dataflow_buffer_like(three_tile, shape=(1, 1), buffer_factor=1)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, 1), buffer_factor=2)
+
+    @ttl.compute()
+    def compute():
+        core_x, _ = ttl.node(dims=2)
+        with thr_dfb.wait() as thr:
+            for local_t in range(tiles_per_core):
+                t = core_x * tiles_per_core + local_t
+                if t < col_tiles:
+                    with v_dfb.wait() as vb, g_dfb.wait() as gb, ve_dfb.wait() as veb, out_dfb.reserve() as o:
+                        o.store(vb + thr * ttl.math.sigmoid(gb) * veb)
+
+    @ttl.datamovement()
+    def dm_read():
+        core_x, _ = ttl.node(dims=2)
+        with thr_dfb.reserve() as blk:
+            tx = ttl.copy(three_tile[0, 0], blk); tx.wait()
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < col_tiles:
+                with v_dfb.reserve() as blk:
+                    tx = ttl.copy(v[0, t], blk); tx.wait()
+                with g_dfb.reserve() as blk:
+                    tx = ttl.copy(gate_logits[0, t], blk); tx.wait()
+                with ve_dfb.reserve() as blk:
+                    tx = ttl.copy(ve_val[0, t], blk); tx.wait()
+
+    @ttl.datamovement()
+    def dm_write():
+        core_x, _ = ttl.node(dims=2)
+        for local_t in range(tiles_per_core):
+            t = core_x * tiles_per_core + local_t
+            if t < col_tiles:
+                with out_dfb.wait() as blk:
+                    tx = ttl.copy(blk, out[0, t]); tx.wait()
 
 
 # -- Device-side tensor copy --
@@ -907,12 +959,20 @@ class NanochatModel:
                 mlp_proj_chunks.append(to_ttnn(chunk, device))
             self.w_mlp_proj.append(mlp_proj_chunks)
 
-            # Value embedding gate and embeddings (CPU)
+            # Value embedding: expanded gate weights and embedding table on device
             ve_gate_key = f"{prefix}.attn.ve_gate.weight"
             ve_key = f"value_embeds.{i}.weight"
             if has_ve(i, self.n_layer) and ve_gate_key in state:
-                self.ve_gate.append(state[ve_gate_key].to(torch.bfloat16))
-                self.value_embed.append(state[ve_key].to(torch.bfloat16))
+                # Expand gate weight: (n_kv_head, 12) -> (TILE, n_embd)
+                # Each head's 128-column region gets the same gate weight
+                gate_w = state[ve_gate_key].to(torch.bfloat16)  # (n_kv_head, 12)
+                gate_t = gate_w.t()  # (12, n_kv_head)
+                expanded = gate_t.repeat_interleave(HEAD_DIM, dim=1)  # (12, n_embd)
+                padded_gate = torch.zeros(TILE, self.n_embd, dtype=torch.bfloat16)
+                padded_gate[:gate_t.shape[0], :] = expanded
+                self.ve_gate.append(to_ttnn(padded_gate, device))
+                # VE table on device for ttnn.embedding lookup
+                self.value_embed.append(to_ttnn(state[ve_key].to(torch.bfloat16), device))
             else:
                 self.ve_gate.append(None)
                 self.value_embed.append(None)
@@ -938,6 +998,7 @@ class NanochatModel:
         self.ninf_tt = to_ttnn_l1(torch.full((TILE, TILE), -10000.0, dtype=torch.bfloat16), device)
         self.zero_tt = to_ttnn_l1(torch.zeros(TILE, TILE, dtype=torch.bfloat16), device)
         self.zero_head_tt = to_ttnn_l1(torch.zeros(TILE, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.three_tt = to_ttnn(torch.full((TILE, TILE), 3.0, dtype=torch.bfloat16), device)
 
         # KV cache on device using ttnn.update_cache
         # Shape: (1, n_head, max_seq, HEAD_DIM) per layer -- standard TTNN KV cache layout
@@ -971,6 +1032,8 @@ class NanochatModel:
         self.mlp_out_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
         self.buf_a_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
         self.partial_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.gate_logits_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.ve_val_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
 
         # Batched head tensors (n_head * TILE, HEAD_DIM)
         self.q_batch_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
@@ -1052,6 +1115,11 @@ class NanochatModel:
         x_cpu = torch.zeros(TILE, n_embd, dtype=torch.bfloat16)
         x_cpu[0] = self.wte[token_id]
 
+        # Token ID on device for VE embedding lookups
+        token_id_tt = ttnn.from_torch(
+            torch.tensor([[token_id]], dtype=torch.uint32),
+            device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
         # Upload and norm
         x_tt = to_ttnn(x_cpu, device)
         self.rmsnorm_embd(x_tt, self.scaler_tt, self.ms_embd_tt, normed_tt)
@@ -1092,19 +1160,17 @@ class NanochatModel:
             reshape_to_heads(q_tt, q_batch_tt)
             reshape_to_heads(k_tt, k_batch_tt)
 
-            # -- Value embedding (CPU readback only for VE layers) --
+            # -- Value embedding (all on device) --
             if self.value_embed[layer_idx] is not None:
-                v_cpu = ttnn.to_torch(v_tt)
-                normed_cpu = ttnn.to_torch(normed_tt)
-                gate_in = normed_cpu[0:1, :12].float()
-                ve_gate_w = self.ve_gate[layer_idx].float()
-                gate = 3.0 * torch.sigmoid(gate_in @ ve_gate_w.t())
-                ve_val = self.value_embed[layer_idx][token_id]
-                for h in range(n_head):
-                    s = h * HEAD_DIM
-                    e = s + HEAD_DIM
-                    v_cpu[0, s:e] += gate[0, h].to(torch.bfloat16) * ve_val[s:e]
-                v_tt = to_ttnn(v_cpu, device)
+                # Gate: normed_tt[:, :32] @ expanded_gate_w -> (TILE, n_embd) gate logits
+                linear_kernel_k1(normed_tt, self.ve_gate[layer_idx], self.gate_logits_tt)
+                # VE lookup on device
+                ve_raw = ttnn.embedding(token_id_tt, self.value_embed[layer_idx])
+                ve_tiled = ttnn.to_layout(ve_raw, ttnn.TILE_LAYOUT)
+                ve_2d = ttnn.reshape(ve_tiled, (TILE, n_embd))
+                # v_out = v + 3 * sigmoid(gate_logits) * ve_val, then copy back
+                ve_gated_add_kernel(v_tt, self.gate_logits_tt, ve_2d, self.three_tt, self.ve_val_tt)
+                copy_kernel(self.ve_val_tt, v_tt)
 
             reshape_to_heads(v_tt, v_batch_tt)
 
