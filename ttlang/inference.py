@@ -994,17 +994,17 @@ class NanochatModel:
         self.lm_head_cols = lm_head.shape[1]
         print(f"  Loaded lm_head: {lm_head.shape}")
 
-        # Constant tiles on device
-        self.scaler_tt = to_ttnn(torch.ones(TILE, TILE, dtype=torch.bfloat16), device)
-        self.ms_embd_tt = to_ttnn(torch.full((TILE, TILE), 1.0 / self.n_embd, dtype=torch.bfloat16), device)
-        self.ms_head_tt = to_ttnn(torch.full((TILE, TILE), 1.0 / HEAD_DIM, dtype=torch.bfloat16), device)
-        self.scale_tt = to_ttnn(torch.full((TILE, TILE), SDPA_SCALE_VAL, dtype=torch.bfloat16), device)
-        self.inv_cap_tt = to_ttnn(torch.full((TILE, TILE), 1.0 / SOFTCAP, dtype=torch.bfloat16), device)
-        self.cap_tt = to_ttnn(torch.full((TILE, TILE), SOFTCAP, dtype=torch.bfloat16), device)
+        # Constant tiles in L1 for fast access
+        self.scaler_tt = to_ttnn_l1(torch.ones(TILE, TILE, dtype=torch.bfloat16), device)
+        self.ms_embd_tt = to_ttnn_l1(torch.full((TILE, TILE), 1.0 / self.n_embd, dtype=torch.bfloat16), device)
+        self.ms_head_tt = to_ttnn_l1(torch.full((TILE, TILE), 1.0 / HEAD_DIM, dtype=torch.bfloat16), device)
+        self.scale_tt = to_ttnn_l1(torch.full((TILE, TILE), SDPA_SCALE_VAL, dtype=torch.bfloat16), device)
+        self.inv_cap_tt = to_ttnn_l1(torch.full((TILE, TILE), 1.0 / SOFTCAP, dtype=torch.bfloat16), device)
+        self.cap_tt = to_ttnn_l1(torch.full((TILE, TILE), SOFTCAP, dtype=torch.bfloat16), device)
         self.ninf_tt = to_ttnn_l1(torch.full((TILE, TILE), -10000.0, dtype=torch.bfloat16), device)
         self.zero_tt = to_ttnn_l1(torch.zeros(TILE, TILE, dtype=torch.bfloat16), device)
         self.zero_head_tt = to_ttnn_l1(torch.zeros(TILE, HEAD_DIM, dtype=torch.bfloat16), device)
-        self.three_tt = to_ttnn(torch.full((TILE, TILE), 3.0, dtype=torch.bfloat16), device)
+        self.three_tt = to_ttnn_l1(torch.full((TILE, TILE), 3.0, dtype=torch.bfloat16), device)
 
         # Precomputed SDPA masks: (max_seq, TILE, padded_seq) on device
         padded_seq = pad_to_tile(self.max_seq)
@@ -1030,39 +1030,40 @@ class NanochatModel:
         cache_mb = self.n_layer * 2 * self.n_head * padded_seq * HEAD_DIM * 2 / 1e6
         print(f"  KV cache: {self.n_layer} layers x 2 x (1, {self.n_head}, {padded_seq}, {HEAD_DIM}) = {cache_mb:.0f}MB")
 
-        # Pre-allocated scratch tensors on device (reused every decode step)
+        # Pre-allocated scratch tensors in L1 (reused every decode step)
+        # (32, 2048) = 128KB each, (512, 128) = 128KB each, (32, 8192) = 512KB each
         n_embd = self.n_embd
         n_head = self.n_head
         mlp_dim = self.mlp_dim
-        self.x_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.normed_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.x0_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.temp_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.normed2_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.q_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.k_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.v_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.y_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.hidden_tt = to_ttnn(torch.zeros(TILE, mlp_dim, dtype=torch.bfloat16), device)
-        self.hidden_act_tt = to_ttnn(torch.zeros(TILE, mlp_dim, dtype=torch.bfloat16), device)
-        self.mlp_out_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.buf_a_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.partial_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.gate_logits_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
-        self.ve_val_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.x_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.normed_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.x0_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.temp_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.normed2_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.q_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.k_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.v_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.y_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.hidden_tt = to_ttnn_l1(torch.zeros(TILE, mlp_dim, dtype=torch.bfloat16), device)
+        self.hidden_act_tt = to_ttnn_l1(torch.zeros(TILE, mlp_dim, dtype=torch.bfloat16), device)
+        self.mlp_out_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.buf_a_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.partial_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.gate_logits_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        self.ve_val_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
 
-        # Batched head tensors (n_head * TILE, HEAD_DIM)
-        self.q_batch_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-        self.k_batch_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-        self.v_batch_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-        self.q_rot_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-        self.k_rot_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-        self.q_norm_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-        self.k_norm_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-        self.sdpa_out_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-        self.attn_concat_tt = to_ttnn(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
+        # Batched head tensors in L1 (n_head * TILE, HEAD_DIM) = 128KB each
+        self.q_batch_tt = to_ttnn_l1(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.k_batch_tt = to_ttnn_l1(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.v_batch_tt = to_ttnn_l1(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.q_rot_tt = to_ttnn_l1(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.k_rot_tt = to_ttnn_l1(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.q_norm_tt = to_ttnn_l1(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.k_norm_tt = to_ttnn_l1(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.sdpa_out_tt = to_ttnn_l1(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
+        self.attn_concat_tt = to_ttnn_l1(torch.zeros(TILE, n_embd, dtype=torch.bfloat16), device)
 
-        # LM head scratch
+        # LM head scratch (logits are large: 32*65536=4MB, keep on DRAM)
         lm_cols = self.lm_head_cols
         self.logits_tt = to_ttnn(torch.zeros(TILE, lm_cols, dtype=torch.bfloat16), device)
         self.logits_cap_tt = to_ttnn(torch.zeros(TILE, lm_cols, dtype=torch.bfloat16), device)
