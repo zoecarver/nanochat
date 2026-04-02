@@ -44,6 +44,11 @@ def to_ttnn(tensor, device):
         tensor.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
         device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
+def to_ttnn_l1(tensor, device):
+    return ttnn.from_torch(
+        tensor.contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+        device=device, memory_config=ttnn.L1_MEMORY_CONFIG)
+
 
 def pad_to_tile(n):
     return ((n + TILE - 1) // TILE) * TILE
@@ -474,96 +479,146 @@ def softcap_kernel(x, inv_cap_tile, cap_tile, out):
                     tx = ttl.copy(blk, out[row, col]); tx.wait()
 
 
-# -- Multi-head SDPA: all heads in parallel on 16 cores --
+# -- Flash Attention: online softmax, streams KV chunks through L1 --
+KV_CHUNK = 1  # tiles per KV chunk
+
+
 @ttl.operation(grid=(SDPA_GRID_X, SDPA_GRID_Y))
-def sdpa_multihead(Q_all, K_all, V_all, scale_tile, scaler, mask, out):
-    """Multi-head SDPA: each core handles one attention head.
+def flash_attention(Q_all, K_all, V_all, scale_tile, scaler, neg_inf_tile,
+                    zero_tile, zero_head, mask, out):
+    n_heads = Q_all.shape[0] // TILE
+    skv = K_all.shape[0] // TILE // n_heads
+    n_chunks = skv // KV_CHUNK
 
-    Inputs are head-batched (stacked vertically):
-      Q_all: (NUM_HEADS * sq, head_dim)
-      K_all: (NUM_HEADS * skv, head_dim)
-      V_all: (NUM_HEADS * skv, head_dim)
-      mask:  (sq, skv) -- shared across heads
-    """
-    total_q = Q_all.shape[0] // TILE
-    sq_tiles = total_q // NUM_HEADS
-    total_kv = K_all.shape[0] // TILE
-    skv_tiles = total_kv // NUM_HEADS
+    q_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(1, HEAD_TILES), buffer_factor=2)
+    sc_dfb = ttl.make_dataflow_buffer_like(scale_tile, shape=(1, 1), buffer_factor=2)
+    scaler_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+    ninf_dfb = ttl.make_dataflow_buffer_like(neg_inf_tile, shape=(1, 1), buffer_factor=2)
+    zero_dfb = ttl.make_dataflow_buffer_like(zero_tile, shape=(1, 1), buffer_factor=2)
+    zero_head_dfb = ttl.make_dataflow_buffer_like(zero_head, shape=(1, HEAD_TILES), buffer_factor=2)
 
-    q_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, HEAD_TILES), buffer_factor=1)
-    k_dfb = ttl.make_dataflow_buffer_like(K_all, shape=(skv_tiles, HEAD_TILES), buffer_factor=1)
-    v_dfb = ttl.make_dataflow_buffer_like(V_all, shape=(skv_tiles, HEAD_TILES), buffer_factor=1)
-    scale_dfb = ttl.make_dataflow_buffer_like(scale_tile, shape=(1, 1), buffer_factor=1)
-    sc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
-    mask_dfb = ttl.make_dataflow_buffer_like(mask, shape=(sq_tiles, skv_tiles), buffer_factor=1)
+    k_dfb = ttl.make_dataflow_buffer_like(K_all, shape=(KV_CHUNK, HEAD_TILES), buffer_factor=2)
+    v_dfb = ttl.make_dataflow_buffer_like(V_all, shape=(KV_CHUNK, HEAD_TILES), buffer_factor=2)
+    mask_dfb = ttl.make_dataflow_buffer_like(mask, shape=(1, KV_CHUNK), buffer_factor=2)
 
-    kt_dfb = ttl.make_dataflow_buffer_like(K_all, shape=(HEAD_TILES, skv_tiles), buffer_factor=2)
-    qk_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
-    scale_row_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(sq_tiles, 1), buffer_factor=2)
-    scale_bcast_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
-    scaled_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
-    max_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(sq_tiles, 1), buffer_factor=2)
-    max_bcast_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
-    exp_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
-    sum_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(sq_tiles, 1), buffer_factor=2)
-    sum_bcast_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(sq_tiles, skv_tiles), buffer_factor=2)
-    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(sq_tiles, HEAD_TILES), buffer_factor=1)
+    kt_dfb = ttl.make_dataflow_buffer_like(K_all, shape=(HEAD_TILES, KV_CHUNK), buffer_factor=2)
+    qk_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(1, KV_CHUNK), buffer_factor=2)
+    scaled_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(1, KV_CHUNK), buffer_factor=2)
+    cm_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+    m_new_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+    m_new_bc_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(1, KV_CHUNK), buffer_factor=2)
+    alpha_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+    alpha_bc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
+    exp_dfb = ttl.make_dataflow_buffer_like(Q_all, shape=(1, KV_CHUNK), buffer_factor=2)
+    cs_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+    corrected_o_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
+
+    m_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+    l_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+    o_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
+
+    l_bc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
+    out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
 
     @ttl.compute()
     def compute():
-        with k_dfb.wait() as kv, kt_dfb.reserve() as kt:
-            kt.store(ttl.transpose(kv))
-        with q_dfb.wait() as qv, kt_dfb.wait() as ktv, qk_dfb.reserve() as qk:
-            qk.store(qv @ ktv)
-        with scale_dfb.wait() as s, scale_row_dfb.reserve() as sr:
-            sr.store(ttl.math.broadcast(s, sr, dims=[0]))
-        with scale_row_dfb.wait() as sr, scale_bcast_dfb.reserve() as sb:
-            sb.store(ttl.math.broadcast(sr, sb, dims=[1]))
-        with scale_bcast_dfb.wait() as sb, qk_dfb.wait() as qkv, mask_dfb.wait() as m, scaled_dfb.reserve() as scd:
-            scd.store(sb * qkv + m)
-        with scaled_dfb.wait() as sdv, sc_dfb.wait() as sc:
-            with max_dfb.reserve() as mx:
-                mx.store(ttl.math.reduce_max(sdv, sc, dims=[1]))
-            with max_dfb.wait() as mxv, max_bcast_dfb.reserve() as mxb:
-                mxb.store(ttl.math.broadcast(mxv, mxb, dims=[1]))
-            with max_bcast_dfb.wait() as mxbv:
-                with exp_dfb.reserve() as ex:
-                    ex.store(ttl.math.exp(sdv - mxbv))
-                with exp_dfb.wait() as exv, sum_dfb.reserve() as sm:
-                    sm.store(ttl.math.reduce_sum(exv, sc, dims=[1]))
-                with sum_dfb.wait() as smv, sum_bcast_dfb.reserve() as smb:
-                    smb.store(ttl.math.broadcast(smv, smb, dims=[1]))
-                with sum_bcast_dfb.wait() as smbv, qk_dfb.reserve() as attn:
-                    attn.store(ttl.math.exp(sdv - mxbv) / smbv)
-        with qk_dfb.wait() as av, v_dfb.wait() as vv, out_dfb.reserve() as o:
-            o.store(av @ vv)
+        nx, ny = ttl.node(dims=2)
+        h = ny * SDPA_GRID_X + nx
+        q_blk = q_dfb.wait()
+        sc_blk = sc_dfb.wait()
+        scaler_blk = scaler_dfb.wait()
+
+        with ninf_dfb.wait() as ni, m_dfb.reserve() as m_init:
+            m_init.store(ni)
+        with zero_dfb.wait() as z, l_dfb.reserve() as l_init:
+            l_init.store(z)
+        with zero_head_dfb.wait() as zh, o_dfb.reserve() as o_init:
+            o_init.store(zh)
+
+        for c in range(n_chunks):
+            with k_dfb.wait() as kc, kt_dfb.reserve() as kt:
+                kt.store(ttl.transpose(kc))
+            with kt_dfb.wait() as ktv, qk_dfb.reserve() as qk:
+                qk.store(q_blk @ ktv)
+            with qk_dfb.wait() as qkv, mask_dfb.wait() as mv:
+                with scaled_dfb.reserve() as scd:
+                    scd.store(sc_blk * qkv + mv)
+
+            with scaled_dfb.wait() as sd:
+                with cm_dfb.reserve() as cm:
+                    cm.store(ttl.math.reduce_max(sd, scaler_blk, dims=[1]))
+                with m_dfb.wait() as m_old:
+                    with cm_dfb.wait() as cm:
+                        with m_new_dfb.reserve() as mn:
+                            mn.store(ttl.math.max(m_old, cm))
+                    with m_new_dfb.wait() as mn:
+                        with alpha_dfb.reserve() as alpha:
+                            alpha.store(ttl.math.exp(m_old - mn))
+                        with m_new_bc_dfb.reserve() as mnb:
+                            mnb.store(ttl.math.broadcast(mn, mnb, dims=[1]))
+                        with m_dfb.reserve() as m_next:
+                            m_next.store(mn)
+                with m_new_bc_dfb.wait() as mnb:
+                    with exp_dfb.reserve() as ex:
+                        ex.store(ttl.math.exp(sd - mnb))
+
+            with exp_dfb.wait() as exp_blk:
+                with cs_dfb.reserve() as cs:
+                    cs.store(ttl.math.reduce_sum(exp_blk, scaler_blk, dims=[1]))
+                with alpha_dfb.wait() as alpha_blk:
+                    with l_dfb.wait() as l_old, cs_dfb.wait() as cs:
+                        with l_dfb.reserve() as l_new:
+                            l_new.store(alpha_blk * l_old + cs)
+                    with alpha_bc_dfb.reserve() as abc:
+                        abc.store(ttl.math.broadcast(alpha_blk, abc, dims=[1]))
+                with alpha_bc_dfb.wait() as abc, o_dfb.wait() as o_old:
+                    with corrected_o_dfb.reserve() as co:
+                        co.store(abc * o_old)
+                with corrected_o_dfb.wait() as co, v_dfb.wait() as vc:
+                    with o_dfb.reserve() as o_new:
+                        o_new.store(co + exp_blk @ vc)
+
+        with l_dfb.wait() as l_final, l_bc_dfb.reserve() as lbc:
+            lbc.store(ttl.math.broadcast(l_final, lbc, dims=[1]))
+        with o_dfb.wait() as o_final, l_bc_dfb.wait() as lbc:
+            with out_dfb.reserve() as o:
+                o.store(o_final / lbc)
+
+        q_blk.pop()
+        sc_blk.pop()
+        scaler_blk.pop()
 
     @ttl.datamovement()
     def dm_read():
         nx, ny = ttl.node(dims=2)
         h = ny * SDPA_GRID_X + nx
-        q_off = h * sq_tiles
-        kv_off = h * skv_tiles
+        kv_off = h * skv
         with q_dfb.reserve() as blk:
-            tx = ttl.copy(Q_all[q_off:q_off + sq_tiles, 0:HEAD_TILES], blk); tx.wait()
-        with k_dfb.reserve() as blk:
-            tx = ttl.copy(K_all[kv_off:kv_off + skv_tiles, 0:HEAD_TILES], blk); tx.wait()
-        with v_dfb.reserve() as blk:
-            tx = ttl.copy(V_all[kv_off:kv_off + skv_tiles, 0:HEAD_TILES], blk); tx.wait()
-        with scale_dfb.reserve() as blk:
-            tx = ttl.copy(scale_tile[0, 0], blk); tx.wait()
+            tx = ttl.copy(Q_all[h:h + 1, 0:HEAD_TILES], blk); tx.wait()
         with sc_dfb.reserve() as blk:
+            tx = ttl.copy(scale_tile[0, 0], blk); tx.wait()
+        with scaler_dfb.reserve() as blk:
             tx = ttl.copy(scaler[0, 0], blk); tx.wait()
-        with mask_dfb.reserve() as blk:
-            tx = ttl.copy(mask[0:sq_tiles, 0:skv_tiles], blk); tx.wait()
+        with ninf_dfb.reserve() as blk:
+            tx = ttl.copy(neg_inf_tile[0, 0], blk); tx.wait()
+        with zero_dfb.reserve() as blk:
+            tx = ttl.copy(zero_tile[0, 0], blk); tx.wait()
+        with zero_head_dfb.reserve() as blk:
+            tx = ttl.copy(zero_head[0, 0:HEAD_TILES], blk); tx.wait()
+        for c in range(n_chunks):
+            with k_dfb.reserve() as blk:
+                tx = ttl.copy(K_all[kv_off + c * KV_CHUNK:kv_off + (c + 1) * KV_CHUNK, 0:HEAD_TILES], blk); tx.wait()
+            with v_dfb.reserve() as blk:
+                tx = ttl.copy(V_all[kv_off + c * KV_CHUNK:kv_off + (c + 1) * KV_CHUNK, 0:HEAD_TILES], blk); tx.wait()
+            with mask_dfb.reserve() as blk:
+                tx = ttl.copy(mask[0, c * KV_CHUNK:(c + 1) * KV_CHUNK], blk); tx.wait()
 
     @ttl.datamovement()
     def dm_write():
         nx, ny = ttl.node(dims=2)
         h = ny * SDPA_GRID_X + nx
-        q_off = h * sq_tiles
         with out_dfb.wait() as blk:
-            tx = ttl.copy(blk, out[q_off:q_off + sq_tiles, 0:HEAD_TILES]); tx.wait()
+            tx = ttl.copy(blk, out[h:h + 1, 0:HEAD_TILES]); tx.wait()
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +760,9 @@ class NanochatModel:
         self.scale_tt = to_ttnn(torch.full((TILE, TILE), SDPA_SCALE_VAL, dtype=torch.bfloat16), device)
         self.inv_cap_tt = to_ttnn(torch.full((TILE, TILE), 1.0 / SOFTCAP, dtype=torch.bfloat16), device)
         self.cap_tt = to_ttnn(torch.full((TILE, TILE), SOFTCAP, dtype=torch.bfloat16), device)
+        self.ninf_tt = to_ttnn_l1(torch.full((TILE, TILE), -10000.0, dtype=torch.bfloat16), device)
+        self.zero_tt = to_ttnn_l1(torch.zeros(TILE, TILE, dtype=torch.bfloat16), device)
+        self.zero_head_tt = to_ttnn_l1(torch.zeros(TILE, HEAD_DIM, dtype=torch.bfloat16), device)
 
         # KV cache: per layer, per head, on CPU
         self.k_cache = [[torch.zeros(self.max_seq, HEAD_DIM, dtype=torch.bfloat16)
@@ -877,8 +935,10 @@ class NanochatModel:
             k_all_tt = to_ttnn(k_all, device)
             v_all_tt = to_ttnn(v_all, device)
             sdpa_out_tt = to_ttnn(torch.zeros(TILE * n_head, HEAD_DIM, dtype=torch.bfloat16), device)
-            sdpa_multihead(q_all_tt, k_all_tt, v_all_tt,
-                           self.scale_tt, self.scaler_tt, mask_tt, sdpa_out_tt)
+            flash_attention(q_all_tt, k_all_tt, v_all_tt,
+                           self.scale_tt, self.scaler_tt,
+                           self.ninf_tt, self.zero_tt, self.zero_head_tt,
+                           mask_tt, sdpa_out_tt)
 
             # Reshape: (n_head*32, 128) -> (32, n_head, 128) -> (32, n_embd)
             sdpa_result = ttnn.to_torch(sdpa_out_tt).view(n_head, TILE, HEAD_DIM)
