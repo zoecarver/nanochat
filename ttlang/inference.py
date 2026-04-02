@@ -131,10 +131,10 @@ def make_rmsnorm_kernel(n_dim):
         @ttl.datamovement()
         def dm_read():
             core_x, _ = ttl.node(dims=2)
-            with sc_dfb.reserve() as blk:
-                tx = ttl.copy(scaler[0, 0], blk); tx.wait()
-            with ms_dfb.reserve() as blk:
-                tx = ttl.copy(mean_scale[0, 0], blk); tx.wait()
+            with sc_dfb.reserve() as blk1, ms_dfb.reserve() as blk2:
+                tx1 = ttl.copy(scaler[0, 0], blk1)
+                tx2 = ttl.copy(mean_scale[0, 0], blk2)
+                tx1.wait(); tx2.wait()
             for local_t in range(tiles_per_core):
                 tile_idx = core_x * tiles_per_core + local_t
                 if tile_idx < seq_tiles:
@@ -204,10 +204,10 @@ def make_linear_kernel(k_tiles):
                     mi = t // col_groups
                     gi = t % col_groups
                     sc = gi * NCOLS
-                    with a_dfb.reserve() as blk:
-                        tx = ttl.copy(x[mi, 0:k_tiles], blk); tx.wait()
-                    with w_dfb.reserve() as blk:
-                        tx = ttl.copy(w[0:k_tiles, sc:sc + NCOLS], blk); tx.wait()
+                    with a_dfb.reserve() as blk1, w_dfb.reserve() as blk2:
+                        tx1 = ttl.copy(x[mi, 0:k_tiles], blk1)
+                        tx2 = ttl.copy(w[0:k_tiles, sc:sc + NCOLS], blk2)
+                        tx1.wait(); tx2.wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -267,10 +267,10 @@ def make_linear_slice_kernel(k_tiles, col_offset_tiles):
                     mi = t // col_groups
                     gi = t % col_groups
                     sc = gi * NCOLS
-                    with a_dfb.reserve() as blk:
-                        tx = ttl.copy(x[mi, col_offset_tiles:col_offset_tiles + k_tiles], blk); tx.wait()
-                    with w_dfb.reserve() as blk:
-                        tx = ttl.copy(w[0:k_tiles, sc:sc + NCOLS], blk); tx.wait()
+                    with a_dfb.reserve() as blk1, w_dfb.reserve() as blk2:
+                        tx1 = ttl.copy(x[mi, col_offset_tiles:col_offset_tiles + k_tiles], blk1)
+                        tx2 = ttl.copy(w[0:k_tiles, sc:sc + NCOLS], blk2)
+                        tx1.wait(); tx2.wait()
 
         @ttl.datamovement()
         def dm_write():
@@ -372,15 +372,12 @@ def rotary_kernel(x, cos, sin, out):
             t = core_x * tiles_per_core + local_t
             if t < seq_tiles:
                 for j in range(HALF_TILES):
-                    with x1_dfb.reserve() as blk:
-                        tx = ttl.copy(x[t, j], blk); tx.wait()
-                    with x2_dfb.reserve() as blk:
-                        tx = ttl.copy(x[t, j + HALF_TILES], blk); tx.wait()
-                    # Broadcast: always read from tile row 0 of cos/sin
-                    with cos_dfb.reserve() as blk:
-                        tx = ttl.copy(cos[0, j], blk); tx.wait()
-                    with sin_dfb.reserve() as blk:
-                        tx = ttl.copy(sin[0, j], blk); tx.wait()
+                    with x1_dfb.reserve() as b1, x2_dfb.reserve() as b2, cos_dfb.reserve() as b3, sin_dfb.reserve() as b4:
+                        tx1 = ttl.copy(x[t, j], b1)
+                        tx2 = ttl.copy(x[t, j + HALF_TILES], b2)
+                        tx3 = ttl.copy(cos[0, j], b3)
+                        tx4 = ttl.copy(sin[0, j], b4)
+                        tx1.wait(); tx2.wait(); tx3.wait(); tx4.wait()
 
     @ttl.datamovement()
     def dm_write():
@@ -389,10 +386,10 @@ def rotary_kernel(x, cos, sin, out):
             t = core_x * tiles_per_core + local_t
             if t < seq_tiles:
                 for j in range(HALF_TILES):
-                    with out_dfb.wait() as blk:
-                        tx = ttl.copy(blk, out[t, j]); tx.wait()
-                    with out_dfb.wait() as blk:
-                        tx = ttl.copy(blk, out[t, j + HALF_TILES]); tx.wait()
+                    with out_dfb.wait() as b1, out_dfb.wait() as b2:
+                        tx1 = ttl.copy(b1, out[t, j])
+                        tx2 = ttl.copy(b2, out[t, j + HALF_TILES])
+                        tx1.wait(); tx2.wait()
 
 
 # -- Residual add: out = x + y --
@@ -425,10 +422,10 @@ def residual_add_kernel(x, y, out):
             if t < total_tiles:
                 row = t // col_tiles
                 col = t % col_tiles
-                with x_dfb.reserve() as blk:
-                    tx = ttl.copy(x[row, col], blk); tx.wait()
-                with y_dfb.reserve() as blk:
-                    tx = ttl.copy(y[row, col], blk); tx.wait()
+                with x_dfb.reserve() as b1, y_dfb.reserve() as b2:
+                    tx1 = ttl.copy(x[row, col], b1)
+                    tx2 = ttl.copy(y[row, col], b2)
+                    tx1.wait(); tx2.wait()
 
     @ttl.datamovement()
     def dm_write():
@@ -542,12 +539,11 @@ def ve_gated_add_kernel(v, gate_logits, ve_val, three_tile, out):
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < col_tiles:
-                with v_dfb.reserve() as blk:
-                    tx = ttl.copy(v[0, t], blk); tx.wait()
-                with g_dfb.reserve() as blk:
-                    tx = ttl.copy(gate_logits[0, t], blk); tx.wait()
-                with ve_dfb.reserve() as blk:
-                    tx = ttl.copy(ve_val[0, t], blk); tx.wait()
+                with v_dfb.reserve() as b1, g_dfb.reserve() as b2, ve_dfb.reserve() as b3:
+                    tx1 = ttl.copy(v[0, t], b1)
+                    tx2 = ttl.copy(gate_logits[0, t], b2)
+                    tx3 = ttl.copy(ve_val[0, t], b3)
+                    tx1.wait(); tx2.wait(); tx3.wait()
 
     @ttl.datamovement()
     def dm_write():
@@ -631,19 +627,19 @@ def scaled_residual_kernel(x, x0, lambda_r_tile, lambda_0_tile, out):
     @ttl.datamovement()
     def dm_read():
         core_x, _ = ttl.node(dims=2)
-        with lr_dfb.reserve() as blk:
-            tx = ttl.copy(lambda_r_tile[0, 0], blk); tx.wait()
-        with l0_dfb.reserve() as blk:
-            tx = ttl.copy(lambda_0_tile[0, 0], blk); tx.wait()
+        with lr_dfb.reserve() as b1, l0_dfb.reserve() as b2:
+            tx1 = ttl.copy(lambda_r_tile[0, 0], b1)
+            tx2 = ttl.copy(lambda_0_tile[0, 0], b2)
+            tx1.wait(); tx2.wait()
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
                 row = t // col_tiles
                 col = t % col_tiles
-                with x_dfb.reserve() as blk:
-                    tx = ttl.copy(x[row, col], blk); tx.wait()
-                with x0_dfb.reserve() as blk:
-                    tx = ttl.copy(x0[row, col], blk); tx.wait()
+                with x_dfb.reserve() as b1, x0_dfb.reserve() as b2:
+                    tx1 = ttl.copy(x[row, col], b1)
+                    tx2 = ttl.copy(x0[row, col], b2)
+                    tx1.wait(); tx2.wait()
 
     @ttl.datamovement()
     def dm_write():
@@ -684,10 +680,10 @@ def softcap_kernel(x, inv_cap_tile, cap_tile, out):
     @ttl.datamovement()
     def dm_read():
         core_x, _ = ttl.node(dims=2)
-        with ic_dfb.reserve() as blk:
-            tx = ttl.copy(inv_cap_tile[0, 0], blk); tx.wait()
-        with c_dfb.reserve() as blk:
-            tx = ttl.copy(cap_tile[0, 0], blk); tx.wait()
+        with ic_dfb.reserve() as b1, c_dfb.reserve() as b2:
+            tx1 = ttl.copy(inv_cap_tile[0, 0], b1)
+            tx2 = ttl.copy(cap_tile[0, 0], b2)
+            tx1.wait(); tx2.wait()
         for local_t in range(tiles_per_core):
             t = core_x * tiles_per_core + local_t
             if t < total_tiles:
@@ -822,25 +818,20 @@ def flash_attention(Q_all, K_all, V_all, scale_tile, scaler, neg_inf_tile,
         nx, ny = ttl.node(dims=2)
         h = ny * SDPA_GRID_X + nx
         kv_off = h * skv
-        with q_dfb.reserve() as blk:
-            tx = ttl.copy(Q_all[h:h + 1, 0:HEAD_TILES], blk); tx.wait()
-        with sc_dfb.reserve() as blk:
-            tx = ttl.copy(scale_tile[0, 0], blk); tx.wait()
-        with scaler_dfb.reserve() as blk:
-            tx = ttl.copy(scaler[0, 0], blk); tx.wait()
-        with ninf_dfb.reserve() as blk:
-            tx = ttl.copy(neg_inf_tile[0, 0], blk); tx.wait()
-        with zero_dfb.reserve() as blk:
-            tx = ttl.copy(zero_tile[0, 0], blk); tx.wait()
-        with zero_head_dfb.reserve() as blk:
-            tx = ttl.copy(zero_head[0, 0:HEAD_TILES], blk); tx.wait()
+        with q_dfb.reserve() as b1, sc_dfb.reserve() as b2, scaler_dfb.reserve() as b3, ninf_dfb.reserve() as b4, zero_dfb.reserve() as b5, zero_head_dfb.reserve() as b6:
+            tx1 = ttl.copy(Q_all[h:h + 1, 0:HEAD_TILES], b1)
+            tx2 = ttl.copy(scale_tile[0, 0], b2)
+            tx3 = ttl.copy(scaler[0, 0], b3)
+            tx4 = ttl.copy(neg_inf_tile[0, 0], b4)
+            tx5 = ttl.copy(zero_tile[0, 0], b5)
+            tx6 = ttl.copy(zero_head[0, 0:HEAD_TILES], b6)
+            tx1.wait(); tx2.wait(); tx3.wait(); tx4.wait(); tx5.wait(); tx6.wait()
         for c in range(n_chunks):
-            with k_dfb.reserve() as blk:
-                tx = ttl.copy(K_all[kv_off + c * KV_CHUNK:kv_off + (c + 1) * KV_CHUNK, 0:HEAD_TILES], blk); tx.wait()
-            with v_dfb.reserve() as blk:
-                tx = ttl.copy(V_all[kv_off + c * KV_CHUNK:kv_off + (c + 1) * KV_CHUNK, 0:HEAD_TILES], blk); tx.wait()
-            with mask_dfb.reserve() as blk:
-                tx = ttl.copy(mask[0, c * KV_CHUNK:(c + 1) * KV_CHUNK], blk); tx.wait()
+            with k_dfb.reserve() as b1, v_dfb.reserve() as b2, mask_dfb.reserve() as b3:
+                tx1 = ttl.copy(K_all[kv_off + c * KV_CHUNK:kv_off + (c + 1) * KV_CHUNK, 0:HEAD_TILES], b1)
+                tx2 = ttl.copy(V_all[kv_off + c * KV_CHUNK:kv_off + (c + 1) * KV_CHUNK, 0:HEAD_TILES], b2)
+                tx3 = ttl.copy(mask[0, c * KV_CHUNK:(c + 1) * KV_CHUNK], b3)
+                tx1.wait(); tx2.wait(); tx3.wait()
 
     @ttl.datamovement()
     def dm_write():
