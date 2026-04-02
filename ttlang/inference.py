@@ -338,7 +338,8 @@ def relu_sq_kernel(x, out):
                     tx = ttl.copy(blk, out[row, col]); tx.wait()
 
 
-# -- Rotary embeddings --
+# -- Rotary embeddings (broadcast cos/sin from single tile-row to all heads) --
+# x: (n_head * TILE, HEAD_DIM), cos/sin: (TILE, HALF_DIM), out: same as x
 @ttl.operation(grid="auto")
 def rotary_kernel(x, cos, sin, out):
     grid_cols, _ = ttl.grid_size(dims=2)
@@ -375,10 +376,11 @@ def rotary_kernel(x, cos, sin, out):
                         tx = ttl.copy(x[t, j], blk); tx.wait()
                     with x2_dfb.reserve() as blk:
                         tx = ttl.copy(x[t, j + HALF_TILES], blk); tx.wait()
+                    # Broadcast: always read from tile row 0 of cos/sin
                     with cos_dfb.reserve() as blk:
-                        tx = ttl.copy(cos[t, j], blk); tx.wait()
+                        tx = ttl.copy(cos[0, j], blk); tx.wait()
                     with sin_dfb.reserve() as blk:
-                        tx = ttl.copy(sin[t, j], blk); tx.wait()
+                        tx = ttl.copy(sin[0, j], blk); tx.wait()
 
     @ttl.datamovement()
     def dm_write():
@@ -1141,12 +1143,10 @@ class NanochatModel:
         copy_kernel(normed_tt, x0_tt)
         copy_kernel(normed_tt, x_tt)
 
-        # Rotary: slice from precomputed table, repeat for all heads
+        # Rotary: slice from precomputed table (rotary kernel broadcasts internally)
         rot_start = pos * TILE
-        cos_pos = ttnn.slice(self.cos_table_tt, [rot_start, 0], [rot_start + TILE, HALF_DIM])
-        sin_pos = ttnn.slice(self.sin_table_tt, [rot_start, 0], [rot_start + TILE, HALF_DIM])
-        cos_tt = ttnn.repeat(cos_pos, ttnn.Shape([n_head, 1]))
-        sin_tt = ttnn.repeat(sin_pos, ttnn.Shape([n_head, 1]))
+        cos_tt = ttnn.slice(self.cos_table_tt, [rot_start, 0], [rot_start + TILE, HALF_DIM])
+        sin_tt = ttnn.slice(self.sin_table_tt, [rot_start, 0], [rot_start + TILE, HALF_DIM])
 
         # SDPA mask: slice from precomputed masks on device
         padded_seq = self.padded_seq
