@@ -1255,6 +1255,7 @@ def generate(model, prompt_tokens, max_tokens=64, temperature=0.8, top_k=50, see
 
     all_tokens = list(prompt_tokens)
     generated = []
+    step_times = []
 
     for step in range(len(prompt_tokens) + max_tokens):
         if step < len(prompt_tokens):
@@ -1266,6 +1267,7 @@ def generate(model, prompt_tokens, max_tokens=64, temperature=0.8, top_k=50, see
         t0 = time.time()
         logits_tt = model.decode_step(token_id, pos)
         dt = time.time() - t0
+        step_times.append(dt)
 
         if step >= len(prompt_tokens) - 1:
             # Sample next token
@@ -1300,7 +1302,7 @@ def generate(model, prompt_tokens, max_tokens=64, temperature=0.8, top_k=50, see
             if len(generated) >= max_tokens:
                 break
 
-    return generated
+    return generated, step_times
 
 
 # ---------------------------------------------------------------------------
@@ -1315,9 +1317,9 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer-dir", type=str,
                         default=None,
                         help="Tokenizer directory (default: same as checkpoint dir)")
-    parser.add_argument("--prompt", type=str, default="The chemical formula of water is",
+    parser.add_argument("--prompt", type=str, default="Write a fibonacci function in Python",
                         help="Input prompt")
-    parser.add_argument("--max-tokens", type=int, default=64, help="Max tokens to generate")
+    parser.add_argument("--max-tokens", type=int, default=256, help="Max tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0=greedy)")
     parser.add_argument("--top-k", type=int, default=50, help="Top-k sampling")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -1349,20 +1351,38 @@ if __name__ == "__main__":
     print(f"Tokens: {prompt_tokens} ({len(prompt_tokens)} tokens)")
 
     print("Generating...", flush=True)
-    t0 = time.time()
-    generated = generate(model, prompt_tokens,
-                         max_tokens=args.max_tokens,
-                         temperature=args.temperature,
-                         top_k=args.top_k,
-                         seed=args.seed)
-    total_time = time.time() - t0
+    generated, step_times = generate(model, prompt_tokens,
+                                      max_tokens=args.max_tokens,
+                                      temperature=args.temperature,
+                                      top_k=args.top_k,
+                                      seed=args.seed)
 
     output_text = model.decode(generated)
     print(f"\n{'='*60}")
     print(f"Prompt: {args.prompt}")
     print(f"Output: {output_text}")
     print(f"{'='*60}")
-    print(f"Generated {len(generated)} tokens in {total_time:.1f}s "
-          f"({len(generated)/total_time:.2f} tok/s)")
+
+    # Timing stats from per-step measurements
+    n_prompt = len(prompt_tokens)
+    prompt_times = step_times[:n_prompt]
+    gen_times = step_times[n_prompt:]
+    total_decode_time = sum(step_times)
+    if gen_times:
+        avg_gen_ms = sum(gen_times) / len(gen_times) * 1000
+        gen_tok_s = len(gen_times) / sum(gen_times)
+        # Skip first 2 steps (warmup/compilation) for steady-state measurement
+        n_warmup = min(2, len(gen_times))
+        steady_times = gen_times[n_warmup:]
+        if steady_times:
+            steady_tok_s = len(steady_times) / sum(steady_times)
+            steady_ms = sum(steady_times) / len(steady_times) * 1000
+        else:
+            steady_tok_s = gen_tok_s
+            steady_ms = avg_gen_ms
+        print(f"Prompt: {n_prompt} tokens in {sum(prompt_times):.1f}s")
+        print(f"Generation: {len(gen_times)} tokens, avg {avg_gen_ms:.1f}ms/tok ({gen_tok_s:.2f} tok/s)")
+        print(f"Steady-state (excl {n_warmup} warmup): {steady_ms:.1f}ms/tok ({steady_tok_s:.2f} tok/s)")
+        print(f"Total decode time: {total_decode_time:.1f}s")
 
     ttnn.close_device(device)
