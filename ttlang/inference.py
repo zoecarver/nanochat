@@ -223,8 +223,79 @@ def make_linear_kernel(k_tiles):
 
     return linear_kernel
 
+
+# -- Fused triple linear: out1=x@w1, out2=x@w2, out3=x@w3 in one kernel --
+# Reads x once, streams through all 3 weight matrices per work unit.
+def make_triple_linear_kernel(k_tiles):
+    @ttl.operation(grid="auto")
+    def triple_linear_kernel(x, w1, w2, w3, out1, out2, out3):
+        FUSED_NCOLS = 2
+        grid_cols, _ = ttl.grid_size(dims=2)
+        m_tiles = x.shape[0] // TILE
+        n_tiles = w1.shape[1] // TILE
+        col_groups = n_tiles // FUSED_NCOLS
+        total = m_tiles * col_groups
+        units_per_core = -(-total // grid_cols)
+
+        a_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, k_tiles), buffer_factor=1)
+        w1_dfb = ttl.make_dataflow_buffer_like(w1, shape=(k_tiles, FUSED_NCOLS), buffer_factor=1)
+        w2_dfb = ttl.make_dataflow_buffer_like(w2, shape=(k_tiles, FUSED_NCOLS), buffer_factor=1)
+        w3_dfb = ttl.make_dataflow_buffer_like(w3, shape=(k_tiles, FUSED_NCOLS), buffer_factor=1)
+        o1_dfb = ttl.make_dataflow_buffer_like(out1, shape=(1, FUSED_NCOLS), buffer_factor=1)
+        o2_dfb = ttl.make_dataflow_buffer_like(out2, shape=(1, FUSED_NCOLS), buffer_factor=1)
+        o3_dfb = ttl.make_dataflow_buffer_like(out3, shape=(1, FUSED_NCOLS), buffer_factor=1)
+
+        @ttl.compute()
+        def compute():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    with a_dfb.wait() as a_blk:
+                        with w1_dfb.wait() as w1_blk, o1_dfb.reserve() as o:
+                            o.store(a_blk @ w1_blk)
+                        with w2_dfb.wait() as w2_blk, o2_dfb.reserve() as o:
+                            o.store(a_blk @ w2_blk)
+                        with w3_dfb.wait() as w3_blk, o3_dfb.reserve() as o:
+                            o.store(a_blk @ w3_blk)
+
+        @ttl.datamovement()
+        def dm_read():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    mi = t // col_groups
+                    gi = t % col_groups
+                    sc = gi * FUSED_NCOLS
+                    with a_dfb.reserve() as b1, w1_dfb.reserve() as b2, w2_dfb.reserve() as b3, w3_dfb.reserve() as b4:
+                        tx1 = ttl.copy(x[mi, 0:k_tiles], b1)
+                        tx2 = ttl.copy(w1[0:k_tiles, sc:sc + FUSED_NCOLS], b2)
+                        tx3 = ttl.copy(w2[0:k_tiles, sc:sc + FUSED_NCOLS], b3)
+                        tx4 = ttl.copy(w3[0:k_tiles, sc:sc + FUSED_NCOLS], b4)
+                        tx1.wait(); tx2.wait(); tx3.wait(); tx4.wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            core_x, _ = ttl.node(dims=2)
+            for local_t in range(units_per_core):
+                t = core_x * units_per_core + local_t
+                if t < total:
+                    mi = t // col_groups
+                    gi = t % col_groups
+                    sc = gi * FUSED_NCOLS
+                    with o1_dfb.wait() as b1, o2_dfb.wait() as b2, o3_dfb.wait() as b3:
+                        tx1 = ttl.copy(b1, out1[mi, sc:sc + FUSED_NCOLS])
+                        tx2 = ttl.copy(b2, out2[mi, sc:sc + FUSED_NCOLS])
+                        tx3 = ttl.copy(b3, out3[mi, sc:sc + FUSED_NCOLS])
+                        tx1.wait(); tx2.wait(); tx3.wait()
+
+    return triple_linear_kernel
+
 # Standard linear for nanochat projections (K=64 for 2048-wide inputs)
 linear_kernel = make_linear_kernel(64)
+# Fused QKV: reads input once, computes 3 matmuls
+triple_linear_kernel = make_triple_linear_kernel(64)
 # Gate matmul for value embeddings: k=1 tile (reads first 32 cols of input)
 linear_kernel_k1 = make_linear_kernel(1)
 
@@ -1151,10 +1222,10 @@ class NanochatModel:
             # -- Pre-attention norm --
             self.rmsnorm_embd(temp_tt, self.scaler_tt, self.ms_embd_tt, normed_tt)
 
-            # -- QKV projections --
-            linear_kernel(normed_tt, self.w_q[layer_idx], q_tt)
-            linear_kernel(normed_tt, self.w_k[layer_idx], k_tt)
-            linear_kernel(normed_tt, self.w_v[layer_idx], v_tt)
+            # -- QKV projections (fused: reads normed once) --
+            triple_linear_kernel(normed_tt,
+                                 self.w_q[layer_idx], self.w_k[layer_idx], self.w_v[layer_idx],
+                                 q_tt, k_tt, v_tt)
 
             # -- Reshape Q, K, V to head-batched on device --
             reshape_to_heads(q_tt, q_batch_tt)
