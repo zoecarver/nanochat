@@ -334,6 +334,18 @@ def to_ttnn_l1(tensor, device):
         device=device, memory_config=ttnn.L1_MEMORY_CONFIG)
 
 
+def to_ttnn_f32(tensor, device):
+    return ttnn.from_torch(
+        tensor.float().contiguous(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+        device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+
+def to_ttnn_l1_f32(tensor, device):
+    return ttnn.from_torch(
+        tensor.float().contiguous(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+        device=device, memory_config=ttnn.L1_MEMORY_CONFIG)
+
+
 # ---------------------------------------------------------------------------
 # TT-Lang: Linear kernel (reused from inference.py)
 # out = x @ w, where x is (M, K) and w is (K, N)
@@ -1766,6 +1778,10 @@ def adamw_kernel(param, grad, m, v, param_out, m_out, v_out,
     po_dfb = ttl.make_dataflow_buffer_like(param_out, shape=(1, 1), buffer_factor=2)
     mo_dfb = ttl.make_dataflow_buffer_like(m_out, shape=(1, 1), buffer_factor=2)
     vo_dfb = ttl.make_dataflow_buffer_like(v_out, shape=(1, 1), buffer_factor=2)
+    # Intermediate DFBs to break register pressure
+    dp_dfb = ttl.make_dataflow_buffer_like(param, shape=(1, 1), buffer_factor=2)
+    step_dfb = ttl.make_dataflow_buffer_like(param, shape=(1, 1), buffer_factor=2)
+    vh_dfb = ttl.make_dataflow_buffer_like(param, shape=(1, 1), buffer_factor=2)
     b1_dfb = ttl.make_dataflow_buffer_like(b1_t, shape=(1, 1), buffer_factor=1)
     omb1_dfb = ttl.make_dataflow_buffer_like(omb1_t, shape=(1, 1), buffer_factor=1)
     b2_dfb = ttl.make_dataflow_buffer_like(b2_t, shape=(1, 1), buffer_factor=1)
@@ -1791,11 +1807,18 @@ def adamw_kernel(param, grad, m, v, param_out, m_out, v_out,
                             mo.store(b1v * mv + omb1v * gv)
                         with vo_dfb.reserve() as vo:
                             vo.store(b2v * vv + omb2v * gv * gv)
-                        with po_dfb.reserve() as po:
-                            m_new = b1v * mv + omb1v * gv
-                            v_hat = b2cv * (b2v * vv + omb2v * gv * gv)
-                            po.store(decv * pv + nlbcv * m_new *
-                                     ttl.math.recip(ttl.math.sqrt(v_hat) + epsv))
+                        # Save decay*p and v_hat separately
+                        with dp_dfb.reserve() as dp:
+                            dp.store(decv * pv)
+                        with vh_dfb.reserve() as vh:
+                            vh.store(b2cv * (b2v * vv + omb2v * gv * gv))
+                        with step_dfb.reserve() as sv:
+                            sv.store(nlbcv * (b1v * mv + omb1v * gv))
+                    # Combine: step / (sqrt(v_hat) + eps) + decay*p
+                    with vh_dfb.wait() as vh, step_dfb.wait() as sv, \
+                         dp_dfb.wait() as dp, po_dfb.reserve() as po:
+                        po.store(dp + sv * ttl.math.recip(
+                            ttl.math.sqrt(vh) + epsv))
 
     @ttl.datamovement()
     def dm_read():
@@ -1846,9 +1869,9 @@ def adamw_kernel(param, grad, m, v, param_out, m_out, v_out,
 
 
 def make_adamw_constants(lr, beta1, beta2, wd, step, device):
-    """Create constant tiles for AdamW kernel."""
+    """Create constant tiles for AdamW kernel (float32 for precision)."""
     def tile(val):
-        return to_ttnn_l1(torch.full((TILE, TILE), val, dtype=torch.bfloat16), device)
+        return to_ttnn_l1_f32(torch.full((TILE, TILE), val), device)
     b1_corr = 1.0 / (1.0 - beta1 ** step)
     b2_corr = 1.0 / (1.0 - beta2 ** step)
     return {
@@ -1960,6 +1983,7 @@ class TrainingState:
         # Backward scratch
         self.dx = alloc(T, C)
         self.d_normed = alloc(T, C)
+        self.d_resid = alloc(T, C)  # persists across attention backward
         self.d_attn_heads = alloc(nT, hd)
         self.d_q_heads = alloc(nT, hd)
         self.d_k_heads = alloc(nT, hd)
@@ -1968,9 +1992,37 @@ class TrainingState:
         self.d_k_rot = alloc(nT, hd)
         self.d_hidden = alloc(T, H)
         self.d_hidden_act = alloc(T, H)
-        # RMSNorm backward needs rstd: (T, TILE) with one scalar per row
-        self.rstd_c = alloc(T, TILE)
-        self.rstd_hd = alloc(nT, TILE)
+
+        # Optimizer state and master weights (float32 for precision)
+        self.m_state = {}
+        self.v_state = {}
+        self.master_weights = {}
+        weight_shapes = {}
+        for i in range(config.n_layer):
+            weight_shapes[f'layer.{i}.w_q'] = (C, C)
+            weight_shapes[f'layer.{i}.w_k'] = (C, C)
+            weight_shapes[f'layer.{i}.w_v'] = (C, C)
+            weight_shapes[f'layer.{i}.w_proj'] = (C, C)
+            weight_shapes[f'layer.{i}.w_fc'] = (C, H)
+            weight_shapes[f'layer.{i}.w_mlp_proj'] = (H, C)
+        weight_shapes['lm_head'] = (V, C)
+        def alloc_f32(r, c):
+            return to_ttnn_f32(torch.zeros(r, c), device)
+        for k, (r, c) in weight_shapes.items():
+            self.m_state[k] = alloc_f32(r, c)
+            self.v_state[k] = alloc_f32(r, c)
+        # Float32 master weights (copy of initial bf16 weights)
+        for i in range(config.n_layer):
+            for wname in ['w_q', 'w_k', 'w_v', 'w_proj', 'w_fc', 'w_mlp_proj']:
+                gname = f'layer.{i}.{wname}'
+                w_list = getattr(self, wname)
+                w_cpu = ttnn.to_torch(w_list[i]).reshape(weight_shapes[gname])
+                self.master_weights[gname] = to_ttnn_f32(w_cpu, device)
+        lm_cpu = ttnn.to_torch(self.lm_head_tt).reshape(V, C)
+        self.master_weights['lm_head'] = to_ttnn_f32(lm_cpu, device)
+        # wte optimizer state on host
+        self.m_state['wte'] = torch.zeros(V, C, dtype=torch.float32)
+        self.v_state['wte'] = torch.zeros(V, C, dtype=torch.float32)
 
     def forward(self, input_ids, targets):
         """Full forward pass. Returns (loss, saved_activations)."""
@@ -2074,8 +2126,14 @@ class TrainingState:
 
         return loss.item(), saved_x, x0_cpu, dlogits
 
+    def _make_rstd(self, x_cpu, dim):
+        """Compute rstd on host, return device tensor (rows, TILE)."""
+        rstd = (x_cpu.pow(2).mean(dim=-1, keepdim=True) + 1e-5).rsqrt()
+        return to_ttnn(rstd.expand(-1, TILE).contiguous().to(torch.bfloat16), self.device)
+
     def backward(self, saved_x, x0_cpu, dlogits, input_ids):
-        """Full backward pass with gradient checkpointing. Returns gradient dict."""
+        """Full backward pass. Uses device kernels for dx flow, host for dW
+        and attention backward."""
         T = self.T
         C = self.config.n_embd
         H = self.config.mlp_hidden
@@ -2087,205 +2145,292 @@ class TrainingState:
 
         grads = {}
 
-        # --- Backward through softcap ---
-        # logits_pre_cap was stored in self.logits (pre-softcap)
+        # --- Softcap + lm_head backward (host, operates on logits) ---
         logits_pre_cpu = ttnn.to_torch(self.logits).reshape(T, -1)[:, :V].float()
-        # dsoftcap: dx = dout * (1 - tanh(x/cap)^2)
         cap = self.config.softcap
         th = torch.tanh(logits_pre_cpu / cap)
         d_logits_pre = dlogits * (1.0 - th * th)
 
-        # --- Backward through lm_head: logits = final_normed @ lm_head^T ---
-        # d_final_normed = d_logits_pre @ lm_head  (dX = dY @ W, W=lm_head^T, so dX = dY @ lm_head)
-        # d_lm_head = d_logits_pre^T @ final_normed (dW^T = dY^T @ X, so d_lm_head = d_logits^T @ normed)
-        final_normed_cpu = ttnn.to_torch(self.s1).reshape(T, C).float()
-        d_final_normed = (d_logits_pre @ self.wte_cpu.float()[:V].clone().zero_().index_copy_(
-            0, torch.arange(V), ttnn.to_torch(self.lm_head_tt).reshape(V, C).float()))
-        # Simpler: lm_head is (V, C), logits = normed @ lm_head^T
         lm_head_cpu = ttnn.to_torch(self.lm_head_tt).reshape(V, C).float()
-        d_final_normed = d_logits_pre @ lm_head_cpu  # (T, C)
-        grads['lm_head'] = d_logits_pre.t() @ final_normed_cpu  # (V, C)
+        final_normed_cpu = ttnn.to_torch(self.s1).reshape(T, C).float()
+        d_final_normed = d_logits_pre @ lm_head_cpu
+        grads['lm_head'] = d_logits_pre.t() @ final_normed_cpu
 
-        # Pad d_final_normed for device ops if needed
-        # Actually, we need d_final_normed on device for rmsnorm backward
-        # But rmsnorm backward also needs x (pre-norm) and rstd
-
-        # For the final rmsnorm backward, we need x_final (last saved_x[-1])
-        # and rstd. Let's compute rstd on host and upload.
+        # --- Final rmsnorm backward (device) ---
         x_final_cpu = saved_x[-1].float()
-        rstd_final = (x_final_cpu.pow(2).mean(dim=-1, keepdim=True) + 1e-5).rsqrt()
+        x_final_tt = to_ttnn(saved_x[-1], device)
+        rstd_tt = self._make_rstd(x_final_cpu, C)
+        d_fn_tt = to_ttnn(d_final_normed.to(torch.bfloat16), device)
+        self.rmsnorm_bwd_c(x_final_tt, d_fn_tt, rstd_tt, self.scaler, self.ms_c, self.dx)
+        # De-alias: dout_tt must not share storage with scratch tensors
+        dout_tt = to_ttnn(ttnn.to_torch(self.dx).reshape(T, C).to(torch.bfloat16), device)
 
-        # RMSNorm backward on host (simpler for final layer)
-        c_val = (d_final_normed * x_final_cpu).sum(dim=-1, keepdim=True)
-        dx_final = rstd_final * d_final_normed - rstd_final.pow(3) * c_val / C * x_final_cpu
-        dout = dx_final  # gradient flowing to layers
-
-        # Accumulate d_x0 for scaled residual backward
         d_x0 = torch.zeros(T, C, dtype=torch.float32)
 
-        # --- Per-layer backward (reverse order, gradient checkpointing) ---
+        # --- Per-layer backward ---
         for i in reversed(range(self.config.n_layer)):
-            x_i_cpu = saved_x[i].float()  # x before this layer's scaled residual
-
-            # === Recompute forward for this layer (on host for intermediates) ===
             lr_val = float(ttnn.to_torch(self.lr_tiles[i]).flatten()[0])
             l0_val = float(ttnn.to_torch(self.l0_tiles[i]).flatten()[0])
-            x_scaled = lr_val * x_i_cpu + l0_val * x0_cpu.float()
 
-            normed = F.rms_norm(x_scaled, (C,))
-            w_q_cpu = ttnn.to_torch(self.w_q[i]).reshape(C, C).float()
-            w_k_cpu = ttnn.to_torch(self.w_k[i]).reshape(C, C).float()
-            w_v_cpu = ttnn.to_torch(self.w_v[i]).reshape(C, C).float()
-            w_proj_cpu = ttnn.to_torch(self.w_proj[i]).reshape(C, C).float()
-            w_fc_cpu = ttnn.to_torch(self.w_fc[i]).reshape(C, H).float()
-            w_mlp_proj_cpu = ttnn.to_torch(self.w_mlp_proj[i]).reshape(H, C).float()
+            # == Recompute forward on device ==
+            x_i_tt = to_ttnn(saved_x[i], device)
+            x0_tt = to_ttnn(x0_cpu, device)
+            scaled_residual_kernel(x_i_tt, x0_tt, self.lr_tiles[i],
+                                   self.l0_tiles[i], self.s2)  # s2 = x_scaled
+            self.rmsnorm_c(self.s2, self.scaler, self.ms_c, self.s1)  # s1 = normed
+            normed_cpu = ttnn.to_torch(self.s1).reshape(T, C).float()
 
-            q_flat = normed @ w_q_cpu
-            k_flat = normed @ w_k_cpu
-            v_flat = normed @ w_v_cpu
-            q_heads = q_flat.view(T, n_head, hd).transpose(0, 1)  # (n_head, T, hd)
-            k_heads = k_flat.view(T, n_head, hd).transpose(0, 1)
-            v_heads = v_flat.view(T, n_head, hd).transpose(0, 1)
+            self.linear_cc(self.s1, self.w_q[i], self.q_flat)
+            self.linear_cc(self.s1, self.w_k[i], self.k_flat)
+            self.linear_cc(self.s1, self.w_v[i], self.v_flat)
+            self.to_heads(self.q_flat, self.q_heads)
+            self.to_heads(self.k_flat, self.k_heads)
+            self.to_heads(self.v_flat, self.v_heads)
+            self.rotary_fwd(self.q_heads, self.cos_tt, self.sin_tt, self.q_rot)
+            self.rotary_fwd(self.k_heads, self.cos_tt, self.sin_tt, self.k_rot)
+            self.rmsnorm_hd(self.q_rot, self.scaler, self.ms_hd, self.q_norm)
+            self.rmsnorm_hd(self.k_rot, self.scaler, self.ms_hd, self.k_norm)
 
-            cos, sin = pt_precompute_rotary(T, hd)
-            cos_2d, sin_2d = cos.squeeze(0).squeeze(1), sin.squeeze(0).squeeze(1)
-            q_rot = torch.zeros_like(q_heads)
-            k_rot = torch.zeros_like(k_heads)
-            for h in range(n_head):
-                x1, x2 = q_heads[h, :, :hd//2], q_heads[h, :, hd//2:]
-                q_rot[h] = torch.cat([x1*cos_2d + x2*sin_2d, -x1*sin_2d + x2*cos_2d], -1)
-                x1, x2 = k_heads[h, :, :hd//2], k_heads[h, :, hd//2:]
-                k_rot[h] = torch.cat([x1*cos_2d + x2*sin_2d, -x1*sin_2d + x2*cos_2d], -1)
-
-            q_norm = F.rms_norm(q_rot, (hd,)) * qk_scale
-            k_norm = F.rms_norm(k_rot, (hd,)) * qk_scale
-
+            # Attention forward on host (need P for backward)
+            q_cpu = ttnn.to_torch(self.q_norm).reshape(n_head, T, hd).float() * qk_scale
+            k_cpu = ttnn.to_torch(self.k_norm).reshape(n_head, T, hd).float() * qk_scale
+            v_cpu = ttnn.to_torch(self.v_heads).reshape(n_head, T, hd).float()
             scale = 1.0 / math.sqrt(hd)
-            scores = q_norm @ k_norm.transpose(-2, -1) * scale
+            scores = q_cpu @ k_cpu.transpose(-2, -1) * scale
             mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
             scores.masked_fill_(mask, float('-inf'))
             P = F.softmax(scores, dim=-1)
-            attn_out = P @ v_heads  # (n_head, T, hd)
-            attn_concat = attn_out.transpose(0, 1).contiguous().view(T, C)
+            attn_out = P @ v_cpu
+            attn_out_tt = to_ttnn(attn_out.to(torch.bfloat16).reshape(n_head * T, hd), device)
 
-            proj_out = attn_concat @ w_proj_cpu
-            x_post_attn = x_scaled + proj_out
+            self.from_heads(attn_out_tt, self.attn_concat)
+            attn_concat_cpu = ttnn.to_torch(self.attn_concat).reshape(T, C).float()
+            self.linear_cc(self.attn_concat, self.w_proj[i], self.proj_out)
+            residual_add_kernel(self.s2, self.proj_out, self.s3)  # s3 = x_post_attn
+            x_post_attn_cpu = ttnn.to_torch(self.s3).reshape(T, C).float()
 
-            normed2 = F.rms_norm(x_post_attn, (C,))
-            hidden_pre = normed2 @ w_fc_cpu
-            hidden_act = F.relu(hidden_pre).square()
-            mlp_out = hidden_act @ w_mlp_proj_cpu
+            self.rmsnorm_c(self.s3, self.scaler, self.ms_c, self.s1)  # s1 = normed2
+            normed2_cpu = ttnn.to_torch(self.s1).reshape(T, C).float()
+            self.linear_ch(self.s1, self.w_fc[i], self.hidden)
+            relu_sq_kernel(self.hidden, self.hidden_act)
+            hidden_pre_cpu = ttnn.to_torch(self.hidden).reshape(T, H).float()
+            hidden_act_cpu = ttnn.to_torch(self.hidden_act).reshape(T, H).float()
+            self.linear_hc(self.hidden_act, self.w_mlp_proj[i], self.mlp_out)
 
-            # === Backward through this layer (all on host for correctness) ===
-            # dout is the gradient from above: d_x_out
+            # == Backward MLP (device kernels for dx, host for dW) ==
 
-            # MLP residual: x_out = x_post_attn + mlp_out
-            d_mlp_out = dout
-            d_x_post_attn = dout.clone()
+            # d_hidden_act = dout @ w_mlp_proj^T
+            self.linear_cc(dout_tt, self.w_mlp_proj_t[i], self.d_hidden_act)
+            dout_cpu = ttnn.to_torch(dout_tt).reshape(T, C).float()
+            grads[f'layer.{i}.w_mlp_proj'] = hidden_act_cpu.t() @ dout_cpu
 
-            # MLP proj backward: mlp_out = hidden_act @ w_mlp_proj
-            d_hidden_act = d_mlp_out @ w_mlp_proj_cpu.t()
-            grads[f'layer.{i}.w_mlp_proj'] = hidden_act.t() @ d_mlp_out
+            # relu_sq backward on device
+            relu_sq_backward_kernel(self.hidden, self.d_hidden_act, self.d_hidden)
 
-            # ReLU^2 backward: hidden_act = relu(hidden)^2, dx = 2*relu(x)*dout
-            d_hidden_pre = 2.0 * F.relu(hidden_pre) * d_hidden_act
+            # d_normed2 = d_hidden @ w_fc^T (k=96, use chunked kernel)
+            self.linear_hc(self.d_hidden, self.w_fc_t[i], self.d_normed)
+            d_hidden_cpu = ttnn.to_torch(self.d_hidden).reshape(T, H).float()
+            grads[f'layer.{i}.w_fc'] = normed2_cpu.t() @ d_hidden_cpu
 
-            # FC backward: hidden = normed2 @ w_fc
-            d_normed2 = d_hidden_pre @ w_fc_cpu.t()
-            grads[f'layer.{i}.w_fc'] = normed2.t() @ d_hidden_pre
+            # rmsnorm backward on device
+            rstd2_tt = self._make_rstd(x_post_attn_cpu, C)
+            self.rmsnorm_bwd_c(self.s3, self.d_normed, rstd2_tt,
+                               self.scaler, self.ms_c, self.dx)
 
-            # Pre-MLP rmsnorm backward
-            rstd2 = (x_post_attn.pow(2).mean(dim=-1, keepdim=True) + 1e-5).rsqrt()
-            c2 = (d_normed2 * x_post_attn).sum(dim=-1, keepdim=True)
-            d_x_post_attn += rstd2 * d_normed2 - rstd2.pow(3) * c2 / C * x_post_attn
+            # d_x_post_attn = rmsnorm_bwd + dout (residual)
+            residual_add_kernel(self.dx, dout_tt, self.d_resid)  # d_resid persists
 
-            # Attention residual: x_post_attn = x_scaled + proj_out
-            d_proj_out = d_x_post_attn
-            d_x_scaled = d_x_post_attn.clone()
+            # == Backward attention ==
 
-            # Proj backward: proj_out = attn_concat @ w_proj
-            d_attn_concat = d_proj_out @ w_proj_cpu.t()
-            grads[f'layer.{i}.w_proj'] = attn_concat.t() @ d_proj_out
+            # d_attn_concat = d_x_post_attn @ w_proj^T
+            self.linear_cc(self.d_resid, self.w_proj_t[i], self.s1)
+            d_x_post_attn_cpu = ttnn.to_torch(self.d_resid).reshape(T, C).float()
+            grads[f'layer.{i}.w_proj'] = attn_concat_cpu.t() @ d_x_post_attn_cpu
 
-            # Reshape from heads backward
-            d_attn_out = d_attn_concat.view(T, n_head, hd).transpose(0, 1)  # (n_head, T, hd)
+            # reshape to heads
+            self.to_heads(self.s1, self.d_attn_heads)
 
             # Attention backward on host
-            dV = P.transpose(-2, -1) @ d_attn_out
-            dP = d_attn_out @ v_heads.transpose(-2, -1)
+            d_attn_cpu = ttnn.to_torch(self.d_attn_heads).reshape(n_head, T, hd).float()
+            dV = P.transpose(-2, -1) @ d_attn_cpu
+            dP = d_attn_cpu @ v_cpu.transpose(-2, -1)
             dS = P * (dP - (dP * P).sum(dim=-1, keepdim=True))
-            dQ_input = dS @ k_norm * scale
-            dK_input = dS.transpose(-2, -1) @ q_norm * scale
+            dQ_input = dS @ k_cpu * scale
+            dK_input = dS.transpose(-2, -1) @ q_cpu * scale
 
-            # QK scale backward (1.15 multiply)
+            # QK norm backward on host (includes 1.15 scale + rmsnorm)
             dQ_norm = dQ_input * qk_scale
             dK_norm = dK_input * qk_scale
+            q_rot_cpu = ttnn.to_torch(self.q_rot).reshape(n_head, T, hd).float()
+            k_rot_cpu = ttnn.to_torch(self.k_rot).reshape(n_head, T, hd).float()
+            rstd_q = (q_rot_cpu.pow(2).mean(-1, keepdim=True) + 1e-5).rsqrt()
+            rstd_k = (k_rot_cpu.pow(2).mean(-1, keepdim=True) + 1e-5).rsqrt()
+            cq = (dQ_norm * q_rot_cpu).sum(-1, keepdim=True)
+            ck = (dK_norm * k_rot_cpu).sum(-1, keepdim=True)
+            dQ_rot = rstd_q * dQ_norm - rstd_q.pow(3) * cq / hd * q_rot_cpu
+            dK_rot = rstd_k * dK_norm - rstd_k.pow(3) * ck / hd * k_rot_cpu
 
-            # QK norm backward (rmsnorm per head)
-            q_rot_for_bwd = q_rot
-            k_rot_for_bwd = k_rot
-            rstd_q = (q_rot_for_bwd.pow(2).mean(dim=-1, keepdim=True) + 1e-5).rsqrt()
-            rstd_k = (k_rot_for_bwd.pow(2).mean(dim=-1, keepdim=True) + 1e-5).rsqrt()
-            cq = (dQ_norm * q_rot_for_bwd).sum(dim=-1, keepdim=True)
-            ck = (dK_norm * k_rot_for_bwd).sum(dim=-1, keepdim=True)
-            dQ_rot = rstd_q * dQ_norm - rstd_q.pow(3) * cq / hd * q_rot_for_bwd
-            dK_rot = rstd_k * dK_norm - rstd_k.pow(3) * ck / hd * k_rot_for_bwd
+            # Rotary backward on device
+            dQ_rot_tt = to_ttnn(dQ_rot.to(torch.bfloat16).reshape(n_head * T, hd), device)
+            dK_rot_tt = to_ttnn(dK_rot.to(torch.bfloat16).reshape(n_head * T, hd), device)
+            self.rotary_bwd(dQ_rot_tt, self.cos_tt, self.sin_tt, self.d_q_heads)
+            self.rotary_bwd(dK_rot_tt, self.cos_tt, self.sin_tt, self.d_k_heads)
 
-            # Rotary backward per head
-            dQ_heads = torch.zeros_like(q_heads)
-            dK_heads = torch.zeros_like(k_heads)
-            for h in range(n_head):
-                dy1, dy2 = dQ_rot[h, :, :hd//2], dQ_rot[h, :, hd//2:]
-                dQ_heads[h] = torch.cat([dy1*cos_2d - dy2*sin_2d,
-                                         dy1*sin_2d + dy2*cos_2d], -1)
-                dy1, dy2 = dK_rot[h, :, :hd//2], dK_rot[h, :, hd//2:]
-                dK_heads[h] = torch.cat([dy1*cos_2d - dy2*sin_2d,
-                                         dy1*sin_2d + dy2*cos_2d], -1)
+            # Reshape from heads and sum QKV backward dx on device
+            self.from_heads(self.d_q_heads, self.q_flat)
+            self.from_heads(self.d_k_heads, self.k_flat)
+            dV_tt = to_ttnn(dV.to(torch.bfloat16).reshape(n_head * T, hd), device)
+            self.from_heads(dV_tt, self.v_flat)
 
-            # Reshape from heads -> flat
-            dQ_flat = dQ_heads.transpose(0, 1).contiguous().view(T, C)
-            dK_flat = dK_heads.transpose(0, 1).contiguous().view(T, C)
-            dV_flat = dV.transpose(0, 1).contiguous().view(T, C)
+            # dW for QKV on host
+            dq_cpu = ttnn.to_torch(self.q_flat).reshape(T, C).float()
+            dk_cpu = ttnn.to_torch(self.k_flat).reshape(T, C).float()
+            dv_cpu = ttnn.to_torch(self.v_flat).reshape(T, C).float()
+            grads[f'layer.{i}.w_q'] = normed_cpu.t() @ dq_cpu
+            grads[f'layer.{i}.w_k'] = normed_cpu.t() @ dk_cpu
+            grads[f'layer.{i}.w_v'] = normed_cpu.t() @ dv_cpu
 
-            # QKV backward
-            d_normed = dQ_flat @ w_q_cpu.t() + dK_flat @ w_k_cpu.t() + dV_flat @ w_v_cpu.t()
-            grads[f'layer.{i}.w_q'] = normed.t() @ dQ_flat
-            grads[f'layer.{i}.w_k'] = normed.t() @ dK_flat
-            grads[f'layer.{i}.w_v'] = normed.t() @ dV_flat
+            # d_normed = dQ@wq^T + dK@wk^T + dV@wv^T (device)
+            self.linear_cc(self.q_flat, self.w_q_t[i], self.dx)
+            self.linear_cc(self.k_flat, self.w_k_t[i], self.d_normed)
+            residual_add_kernel(self.dx, self.d_normed, self.s1)
+            self.linear_cc(self.v_flat, self.w_v_t[i], self.dx)
+            residual_add_kernel(self.s1, self.dx, self.d_normed)
 
-            # Pre-attention rmsnorm backward
-            rstd1 = (x_scaled.pow(2).mean(dim=-1, keepdim=True) + 1e-5).rsqrt()
-            c1 = (d_normed * x_scaled).sum(dim=-1, keepdim=True)
-            d_x_scaled += rstd1 * d_normed - rstd1.pow(3) * c1 / C * x_scaled
+            # Pre-attention rmsnorm backward (device)
+            x_scaled_cpu = ttnn.to_torch(self.s2).reshape(T, C).float()
+            rstd1_tt = self._make_rstd(x_scaled_cpu, C)
+            self.rmsnorm_bwd_c(self.s2, self.d_normed, rstd1_tt,
+                               self.scaler, self.ms_c, self.dx)
 
-            # Scaled residual backward: x_scaled = lr * x_prev + l0 * x0
-            dout = lr_val * d_x_scaled  # d_x_prev
-            d_x0 += l0_val * d_x_scaled
+            # d_x_scaled = rmsnorm_bwd + d_x_post_attn (residual)
+            residual_add_kernel(self.dx, self.d_resid, self.s1)
 
-        # Embedding backward: scatter-add
+            # Scaled residual backward (host, scalar multiply)
+            d_x_scaled_cpu = ttnn.to_torch(self.s1).reshape(T, C).float()
+            dout_cpu = lr_val * d_x_scaled_cpu
+            d_x0 += l0_val * d_x_scaled_cpu
+            dout_tt = to_ttnn(dout_cpu.to(torch.bfloat16), device)
+
+        # Embedding backward (host)
         grads['wte'] = torch.zeros_like(self.wte_cpu.float())
-        dout_embed_cpu = dout
-        # d_x0 also flows through initial rmsnorm backward
         x_embed_cpu = self.wte_cpu[input_ids.squeeze(0)].float()
-        rstd_e = (x_embed_cpu.pow(2).mean(dim=-1, keepdim=True) + 1e-5).rsqrt()
-        # Both dout (from layer 0) and d_x0 flow into the embedding gradient
-        d_embed_total = dout + d_x0  # before initial rmsnorm
-        # Actually, x0 = rmsnorm(embed), so d_embed = rmsnorm_backward(d_x0 + dout, embed)
-        # Wait: dout is already the gradient through all layers and scaled residuals.
-        # And d_x0 accumulated from all layers.
-        # The initial rmsnorm: x0 = rmsnorm(embed), and x_initial = x0
-        # Layer 0 scaled_residual reads x_initial (= x0). So dout from layer 0
-        # is d_x_initial. And d_x0 accumulated from all l0*d_x_scaled terms.
-        # Total gradient into x0: dout + d_x0
-        d_total = dout + d_x0
-        ce = (d_total * x_embed_cpu).sum(dim=-1, keepdim=True)
+        d_total = dout_cpu + d_x0
+        rstd_e = (x_embed_cpu.pow(2).mean(-1, keepdim=True) + 1e-5).rsqrt()
+        ce = (d_total * x_embed_cpu).sum(-1, keepdim=True)
         d_embed = rstd_e * d_total - rstd_e.pow(3) * ce / C * x_embed_cpu
-        # Scatter-add for embedding gradient
         for t_idx in range(T):
             tok = input_ids[0, t_idx].item()
             grads['wte'][tok] += d_embed[t_idx]
 
         return grads
+
+    def adamw_step(self, grads, step, lr=1e-3, beta1=0.9, beta2=0.999, wd=0.01,
+                   use_host=False):
+        """Update weights. use_host=True for host-side AdamW (debugging)."""
+        device = self.device
+        C, H, V = self.config.n_embd, self.config.mlp_hidden, self.config.vocab_size
+
+        attr_map = {
+            'w_q': ('w_q', 'w_q_t'), 'w_k': ('w_k', 'w_k_t'),
+            'w_v': ('w_v', 'w_v_t'), 'w_proj': ('w_proj', 'w_proj_t'),
+            'w_fc': ('w_fc', 'w_fc_t'), 'w_mlp_proj': ('w_mlp_proj', 'w_mlp_proj_t'),
+        }
+
+        if use_host:
+            self._adamw_step_host(grads, step, lr, beta1, beta2, wd, attr_map)
+        else:
+            self._adamw_step_device(grads, step, lr, beta1, beta2, wd, attr_map)
+
+    def _adamw_step_host(self, grads, step, lr, beta1, beta2, wd, attr_map):
+        """Host-side AdamW for all weights (debugging reference)."""
+        device = self.device
+        C, H, V = self.config.n_embd, self.config.mlp_hidden, self.config.vocab_size
+
+        def host_update(name, w_cpu, g):
+            g = g.float()
+            if name not in self._host_m:
+                self._host_m[name] = torch.zeros_like(g)
+                self._host_v[name] = torch.zeros_like(g)
+            m, v = self._host_m[name], self._host_v[name]
+            m[:] = beta1 * m + (1 - beta1) * g
+            v[:] = beta2 * v + (1 - beta2) * g * g
+            m_hat = m / (1 - beta1 ** (step + 1))
+            v_hat = v / (1 - beta2 ** (step + 1))
+            return (w_cpu.float() * (1 - lr * wd) -
+                    lr * m_hat / (v_hat.sqrt() + 1e-8)).to(torch.bfloat16)
+
+        if not hasattr(self, '_host_m'):
+            self._host_m = {}
+            self._host_v = {}
+
+        for i in range(self.config.n_layer):
+            for wname in ['w_q', 'w_k', 'w_v', 'w_proj', 'w_fc', 'w_mlp_proj']:
+                gname = f'layer.{i}.{wname}'
+                w_list = getattr(self, attr_map[wname][0])
+                wt_list = getattr(self, attr_map[wname][1])
+                w_cpu = ttnn.to_torch(w_list[i]).reshape(grads[gname].shape)
+                w_new = host_update(gname, w_cpu, grads[gname])
+                w_list[i] = to_ttnn(w_new, device)
+                wt_list[i] = to_ttnn(w_new.t().contiguous(), device)
+
+        # lm_head
+        lm_cpu = ttnn.to_torch(self.lm_head_tt).reshape(V, C)
+        lm_new = host_update('lm_head', lm_cpu, grads['lm_head'])
+        self.lm_head_tt = to_ttnn(lm_new, device)
+        self.lm_head_t = to_ttnn(lm_new.t().contiguous(), device)
+
+        # wte
+        self.wte_cpu = host_update('wte', self.wte_cpu, grads['wte'])
+
+    def _adamw_step_device(self, grads, step, lr, beta1, beta2, wd, attr_map):
+        """Device-side AdamW using float32 master weights."""
+        device = self.device
+        C, H, V = self.config.n_embd, self.config.mlp_hidden, self.config.vocab_size
+        constants = make_adamw_constants(lr, beta1, beta2, wd, step + 1, device)
+
+        for i in range(self.config.n_layer):
+            for wname in ['w_q', 'w_k', 'w_v', 'w_proj', 'w_fc', 'w_mlp_proj']:
+                gname = f'layer.{i}.{wname}'
+                g_tt = to_ttnn_f32(grads[gname], device)
+                w_list = getattr(self, attr_map[wname][0])
+                wt_list = getattr(self, attr_map[wname][1])
+                mw = self.master_weights[gname]
+                adamw_kernel(mw, g_tt, self.m_state[gname],
+                             self.v_state[gname], mw,
+                             self.m_state[gname], self.v_state[gname],
+                             constants['b1'], constants['omb1'],
+                             constants['b2'], constants['omb2'],
+                             constants['nlbc'], constants['b2c'],
+                             constants['decay'], constants['eps'])
+                # Cast back to bf16 for forward/backward
+                w_cpu = ttnn.to_torch(mw).reshape(grads[gname].shape)
+                w_list[i] = to_ttnn(w_cpu.to(torch.bfloat16), device)
+                wt_list[i] = to_ttnn(w_cpu.t().contiguous().to(torch.bfloat16), device)
+
+        # lm_head on device
+        g_tt = to_ttnn_f32(grads['lm_head'], device)
+        mw = self.master_weights['lm_head']
+        adamw_kernel(mw, g_tt, self.m_state['lm_head'],
+                     self.v_state['lm_head'], mw,
+                     self.m_state['lm_head'], self.v_state['lm_head'],
+                     constants['b1'], constants['omb1'],
+                     constants['b2'], constants['omb2'],
+                     constants['nlbc'], constants['b2c'],
+                     constants['decay'], constants['eps'])
+        lm_cpu = ttnn.to_torch(mw).reshape(V, C)
+        self.lm_head_tt = to_ttnn(lm_cpu.to(torch.bfloat16), device)
+        self.lm_head_t = to_ttnn(lm_cpu.t().contiguous().to(torch.bfloat16), device)
+
+        # wte on host (float32)
+        g = grads['wte'].float()
+        m, v = self.m_state['wte'], self.v_state['wte']
+        m[:] = beta1 * m + (1 - beta1) * g
+        v[:] = beta2 * v + (1 - beta2) * g * g
+        m_hat = m / (1 - beta1 ** (step + 1))
+        v_hat = v / (1 - beta2 ** (step + 1))
+        self.wte_cpu = (self.wte_cpu.float() * (1 - lr * wd) -
+                        lr * m_hat / (v_hat.sqrt() + 1e-8)).to(torch.bfloat16)
 
 
 def test_full_forward(device):
@@ -2337,17 +2482,6 @@ def test_training(device, config=D1_CONFIG, T=128, n_steps=5, label="d1"):
 
     state = TrainingState(config, model, device, T=T)
 
-    # Initialize optimizer state (zeros)
-    C = config.n_embd
-    H = config.mlp_hidden
-    V = config.vocab_size
-
-    # Collect all weight tensors and their shapes for AdamW
-    param_names = ['wte', 'lm_head']
-    for i in range(config.n_layer):
-        param_names.extend([f'layer.{i}.{k}' for k in
-                           ['w_q', 'w_k', 'w_v', 'w_proj', 'w_fc', 'w_mlp_proj']])
-
     losses = []
     for step in range(n_steps):
         loss, saved_x, x0_cpu, dlogits = state.forward(input_ids, targets)
@@ -2355,52 +2489,136 @@ def test_training(device, config=D1_CONFIG, T=128, n_steps=5, label="d1"):
         print(f"  step {step}: loss={loss:.4f}")
 
         grads = state.backward(saved_x, x0_cpu, dlogits, input_ids)
-
-        # AdamW on host for simplicity (validates forward + backward)
-        if step == 0:
-            m_state = {k: torch.zeros_like(v) for k, v in grads.items()}
-            v_state = {k: torch.zeros_like(v) for k, v in grads.items()}
-
-        for name in grads:
-            g = grads[name]
-            m_state[name] = beta1 * m_state[name] + (1 - beta1) * g
-            v_state[name] = beta2 * v_state[name] + (1 - beta2) * g * g
-            m_hat = m_state[name] / (1 - beta1 ** (step + 1))
-            v_hat = v_state[name] / (1 - beta2 ** (step + 1))
-
-            # Get current param
-            if name == 'wte':
-                param = state.wte_cpu.float()
-                param = param * (1 - lr * wd) - lr * m_hat / (v_hat.sqrt() + 1e-8)
-                state.wte_cpu = param.to(torch.bfloat16)
-            elif name == 'lm_head':
-                param = ttnn.to_torch(state.lm_head_tt).reshape(V, C).float()
-                param = param * (1 - lr * wd) - lr * m_hat / (v_hat.sqrt() + 1e-8)
-                state.lm_head_tt = to_ttnn(param.to(torch.bfloat16), device)
-                state.lm_head_t = to_ttnn(param.t().contiguous().to(torch.bfloat16), device)
-            else:
-                parts = name.split('.')
-                layer_idx = int(parts[1])
-                weight_name = parts[2]
-                tt_w = getattr(state, f'w_{weight_name[2:]}' if weight_name.startswith('w_') else weight_name)
-                # Map name to attribute
-                attr_map = {
-                    'w_q': ('w_q', 'w_q_t'), 'w_k': ('w_k', 'w_k_t'),
-                    'w_v': ('w_v', 'w_v_t'), 'w_proj': ('w_proj', 'w_proj_t'),
-                    'w_fc': ('w_fc', 'w_fc_t'), 'w_mlp_proj': ('w_mlp_proj', 'w_mlp_proj_t'),
-                }
-                w_attr, wt_attr = attr_map[weight_name]
-                w_list = getattr(state, w_attr)
-                wt_list = getattr(state, wt_attr)
-                param = ttnn.to_torch(w_list[layer_idx]).reshape(g.shape).float()
-                param = param * (1 - lr * wd) - lr * m_hat / (v_hat.sqrt() + 1e-8)
-                w_list[layer_idx] = to_ttnn(param.to(torch.bfloat16), device)
-                wt_list[layer_idx] = to_ttnn(param.t().contiguous().to(torch.bfloat16), device)
+        state.adamw_step(grads, step, lr=lr)
 
     print(f"\n  losses: {[f'{l:.4f}' for l in losses]}")
     assert losses[-1] < losses[0], \
         f"Loss did not decrease: {losses[0]:.4f} -> {losses[-1]:.4f}"
     print("  Loss decreased: PASS")
+
+
+def test_adamw_kernel(device):
+    """Test AdamW kernel against PyTorch reference."""
+    print("\n" + "=" * 60)
+    print("Testing AdamW kernel")
+    print("=" * 60)
+
+    torch.manual_seed(42)
+    rows, cols = 64, 64  # 2x2 tiles
+    param = torch.randn(rows, cols, dtype=torch.bfloat16)
+    grad = torch.randn(rows, cols, dtype=torch.bfloat16)
+    m = torch.zeros(rows, cols, dtype=torch.float32)
+    v = torch.zeros(rows, cols, dtype=torch.float32)
+
+    lr, beta1, beta2, wd = 1e-3, 0.9, 0.999, 0.01
+    step = 1
+
+    # PyTorch reference (float32)
+    p_ref = param.float().clone()
+    g_ref = grad.float()
+    m_ref = m.clone()
+    v_ref = v.clone()
+    m_ref = beta1 * m_ref + (1 - beta1) * g_ref
+    v_ref = beta2 * v_ref + (1 - beta2) * g_ref * g_ref
+    m_hat = m_ref / (1 - beta1 ** step)
+    v_hat = v_ref / (1 - beta2 ** step)
+    p_ref = p_ref * (1 - lr * wd) - lr * m_hat / (v_hat.sqrt() + 1e-8)
+
+    # Device kernel
+    p_tt = to_ttnn(param, device)
+    g_tt = to_ttnn(grad, device)
+    m_tt = to_ttnn(m.to(torch.bfloat16), device)
+    v_tt = to_ttnn(v.to(torch.bfloat16), device)
+    po_tt = to_ttnn(torch.zeros(rows, cols, dtype=torch.bfloat16), device)
+    mo_tt = to_ttnn(torch.zeros(rows, cols, dtype=torch.bfloat16), device)
+    vo_tt = to_ttnn(torch.zeros(rows, cols, dtype=torch.bfloat16), device)
+    constants = make_adamw_constants(lr, beta1, beta2, wd, step, device)
+    adamw_kernel(p_tt, g_tt, m_tt, v_tt, po_tt, mo_tt, vo_tt,
+                 constants['b1'], constants['omb1'],
+                 constants['b2'], constants['omb2'],
+                 constants['nlbc'], constants['b2c'],
+                 constants['decay'], constants['eps'])
+
+    p_out = ttnn.to_torch(po_tt).reshape(rows, cols).float()
+    m_out = ttnn.to_torch(mo_tt).reshape(rows, cols).float()
+    v_out = ttnn.to_torch(vo_tt).reshape(rows, cols).float()
+
+    p_err = (p_out - p_ref).abs().max().item()
+    m_err = (m_out - m_ref.to(torch.bfloat16).float()).abs().max().item()
+    v_err = (v_out - v_ref.to(torch.bfloat16).float()).abs().max().item()
+
+    # Check weight update magnitude
+    p_delta_ref = (p_ref - param.float()).abs().mean().item()
+    p_delta_dev = (p_out - param.float()).abs().mean().item()
+
+    print(f"  param max_err: {p_err:.6f}")
+    print(f"  m max_err: {m_err:.6f}")
+    print(f"  v max_err: {v_err:.6f}")
+    print(f"  ref weight update magnitude: {p_delta_ref:.6f}")
+    print(f"  dev weight update magnitude: {p_delta_dev:.6f}")
+    print(f"  ref param sample: {p_ref.flatten()[:5].tolist()}")
+    print(f"  dev param sample: {p_out.flatten()[:5].tolist()}")
+
+    assert p_err < 0.01, f"AdamW param error too large: {p_err}"
+    print("  PASS")
+
+
+def test_backward_triage(device, config=D1_CONFIG, T=128):
+    """Compare device backward gradients against PyTorch autograd."""
+    print("\n" + "=" * 60)
+    print(f"Backward triage: device vs autograd (d{config.n_layer}, T={T})")
+    print("=" * 60)
+
+    torch.manual_seed(42)
+    model = PytorchRefModel(config, dtype=torch.float32)
+    for layer in model.layers:
+        layer['w_proj'] = torch.randn_like(layer['w_proj']) * 0.01
+        layer['w_mlp_proj'] = torch.randn_like(layer['w_mlp_proj']) * 0.01
+
+    input_ids = torch.randint(0, config.vocab_size, (1, T))
+    targets = torch.randint(0, config.vocab_size, (1, T))
+
+    # --- PyTorch autograd reference ---
+    ref_loss, ref_grads = model.forward_backward(input_ids, targets)
+    print(f"  PyTorch ref loss: {ref_loss:.6f}")
+
+    # --- Device backward ---
+    state = TrainingState(config, model, device, T=T)
+    loss, saved_x, x0_cpu, dlogits = state.forward(input_ids, targets)
+    print(f"  Device fwd loss:  {loss:.6f}")
+    dev_grads = state.backward(saved_x, x0_cpu, dlogits, input_ids)
+
+    # --- Compare ---
+    print(f"\n  {'gradient':30s} {'ref_norm':>10s} {'dev_norm':>10s} {'diff_norm':>10s} {'rel_err':>10s}")
+    print("  " + "-" * 75)
+    all_ok = True
+    for name in sorted(ref_grads.keys()):
+        if name in ('resid_lambdas', 'x0_lambdas'):
+            continue
+        ref_g = ref_grads[name].float()
+        dev_g = dev_grads.get(name)
+        if dev_g is None:
+            print(f"  {name:30s} MISSING from device backward")
+            all_ok = False
+            continue
+        dev_g = dev_g.float()
+        if ref_g.shape != dev_g.shape:
+            print(f"  {name:30s} shape mismatch: ref={list(ref_g.shape)} dev={list(dev_g.shape)}")
+            all_ok = False
+            continue
+        rn = ref_g.norm().item()
+        dn = dev_g.norm().item()
+        diff = (ref_g - dev_g).norm().item()
+        rel = diff / max(rn, 1e-8)
+        status = "OK" if rel < 0.1 else "BAD" if rel < 1.0 else "WRONG"
+        if status != "OK":
+            all_ok = False
+        print(f"  {name:30s} {rn:10.4f} {dn:10.4f} {diff:10.4f} {rel:10.4f}  {status}")
+
+    if all_ok:
+        print("\n  All gradients match (rel_err < 0.1): PASS")
+    else:
+        print("\n  Some gradients diverge: FAIL")
 
 
 # ---------------------------------------------------------------------------
@@ -2409,6 +2627,7 @@ def test_training(device, config=D1_CONFIG, T=128, n_steps=5, label="d1"):
 if __name__ == "__main__":
     device = ttnn.open_device(device_id=0)
     try:
-        test_training(device, D12_CONFIG, T=2048, n_steps=10, label="d12-T2048")
+        test_training(device, D1_CONFIG, T=128, n_steps=5, label="d1")
+        test_training(device, D12_CONFIG, T=2048, n_steps=3, label="d12-T2048")
     finally:
         ttnn.close_device(device)
