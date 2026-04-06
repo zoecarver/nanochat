@@ -1290,7 +1290,8 @@ def make_training_attention_kernel(n_head, seq_tiles):
     """
     @ttl.operation(grid=(n_head, 1))
     def training_attention(Q, K, V, scale_tile, scaler, neg_inf_tile,
-                           zero_tile, zero_head, causal_mask, out):
+                           zero_tile, zero_head, causal_mask,
+                           out, m_out, l_out):
         q_dfb = ttl.make_dataflow_buffer_like(Q, shape=(1, HEAD_TILES), buffer_factor=2)
         k_dfb = ttl.make_dataflow_buffer_like(K, shape=(1, HEAD_TILES), buffer_factor=2)
         v_dfb = ttl.make_dataflow_buffer_like(V, shape=(1, HEAD_TILES), buffer_factor=2)
@@ -1317,9 +1318,8 @@ def make_training_attention_kernel(n_head, seq_tiles):
         o_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
         l_bc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
         out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
-
-        # Temp DFB for draining m after inner loop
-        m_drain_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        m_out_dfb = ttl.make_dataflow_buffer_like(m_out, shape=(1, 1), buffer_factor=2)
+        l_out_dfb = ttl.make_dataflow_buffer_like(l_out, shape=(1, 1), buffer_factor=2)
 
         @ttl.compute()
         def compute():
@@ -1379,16 +1379,18 @@ def make_training_attention_kernel(n_head, seq_tiles):
                                     with o_dfb.reserve() as o_new:
                                         o_new.store(co + exp_blk @ vc)
 
-                        # Drain m (l and o consumed in normalize below)
-                        with m_dfb.wait() as m_final, m_drain_dfb.reserve() as md:
-                            md.store(m_final)
-
-                    # Normalize: o = o / l
-                    with l_dfb.wait() as l_final, l_bc_dfb.reserve() as lbc:
-                        lbc.store(ttl.math.broadcast(l_final, lbc, dims=[1]))
-                    with o_dfb.wait() as o_final, l_bc_dfb.wait() as lbc:
-                        with out_dfb.reserve() as o:
-                            o.store(o_final / lbc)
+                    # Save m and l, normalize o
+                    with m_dfb.wait() as m_final:
+                        with m_out_dfb.reserve() as ms:
+                            ms.store(m_final)
+                        with l_dfb.wait() as l_final:
+                            with l_out_dfb.reserve() as ls:
+                                ls.store(l_final)
+                            with l_bc_dfb.reserve() as lbc:
+                                lbc.store(ttl.math.broadcast(l_final, lbc, dims=[1]))
+                        with o_dfb.wait() as o_final, l_bc_dfb.wait() as lbc:
+                            with out_dfb.reserve() as o:
+                                o.store(o_final / lbc)
 
         @ttl.datamovement()
         def dm_read():
@@ -1431,14 +1433,248 @@ def make_training_attention_kernel(n_head, seq_tiles):
             h, _ = ttl.node(dims=2)
             out_base = h * seq_tiles
             for q_row in range(seq_tiles):
-                # Drain the m accumulator (written by compute, discard)
-                with m_drain_dfb.wait() as _discard:
-                    pass
+                with m_out_dfb.wait() as b:
+                    tx = ttl.copy(b, m_out[out_base + q_row, 0]); tx.wait()
+                with l_out_dfb.wait() as b:
+                    tx = ttl.copy(b, l_out[out_base + q_row, 0]); tx.wait()
                 with out_dfb.wait() as b:
                     tx = ttl.copy(b, out[out_base + q_row:out_base + q_row + 1, 0:HEAD_TILES])
                     tx.wait()
 
     return training_attention
+
+
+# ---------------------------------------------------------------------------
+# TT-Lang: Training attention backward (FA2-style, recompute P in L1)
+# ---------------------------------------------------------------------------
+def make_training_attention_backward_kernel(n_head, seq_tiles):
+    """FA2-style attention backward. Recomputes P block-by-block in L1.
+    Outer loop over KV cols, inner over Q rows (causal).
+    dK, dV accumulate in L1. dQ via read-modify-write from DRAM.
+    D_i = rowsum(dO_i * O_i) computed inline each iteration.
+
+    All (1,1) tile scalar-to-vector ops use matmul: (1,1) @ (1, HEAD_TILES).
+    K^T, V^T precomputed per KV col and cycled through the inner loop.
+    """
+    @ttl.operation(grid=(n_head, 1))
+    def training_attention_backward(Q, K, V, O, dO, m_saved, l_saved,
+                                     scale_tile, scaler, causal_mask,
+                                     zero_tile, zero_head,
+                                     dQ, dK, dV):
+        # Streaming from DRAM
+        q_dfb = ttl.make_dataflow_buffer_like(Q, shape=(1, HEAD_TILES), buffer_factor=2)
+        k_dfb = ttl.make_dataflow_buffer_like(K, shape=(1, HEAD_TILES), buffer_factor=2)
+        v_dfb = ttl.make_dataflow_buffer_like(V, shape=(1, HEAD_TILES), buffer_factor=2)
+        o_dfb = ttl.make_dataflow_buffer_like(O, shape=(1, HEAD_TILES), buffer_factor=2)
+        do_dfb = ttl.make_dataflow_buffer_like(dO, shape=(1, HEAD_TILES), buffer_factor=2)
+        m_dfb = ttl.make_dataflow_buffer_like(m_saved, shape=(1, 1), buffer_factor=2)
+        l_dfb = ttl.make_dataflow_buffer_like(l_saved, shape=(1, 1), buffer_factor=2)
+        mask_dfb = ttl.make_dataflow_buffer_like(causal_mask, shape=(1, 1), buffer_factor=2)
+
+        # dQ read-modify-write
+        dq_in_dfb = ttl.make_dataflow_buffer_like(dQ, shape=(1, HEAD_TILES), buffer_factor=2)
+        dq_out_dfb = ttl.make_dataflow_buffer_like(dQ, shape=(1, HEAD_TILES), buffer_factor=2)
+
+        # dK, dV per-col output
+        dk_out_dfb = ttl.make_dataflow_buffer_like(dK, shape=(1, HEAD_TILES), buffer_factor=2)
+        dv_out_dfb = ttl.make_dataflow_buffer_like(dV, shape=(1, HEAD_TILES), buffer_factor=2)
+
+        # Constants
+        sc_dfb = ttl.make_dataflow_buffer_like(scale_tile, shape=(1, 1), buffer_factor=1)
+        scaler_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
+        zh_dfb = ttl.make_dataflow_buffer_like(zero_head, shape=(1, HEAD_TILES), buffer_factor=1)
+        # Intermediates
+        kt_dfb = ttl.make_dataflow_buffer_like(K, shape=(HEAD_TILES, 1), buffer_factor=2)
+        vt_dfb = ttl.make_dataflow_buffer_like(V, shape=(HEAD_TILES, 1), buffer_factor=2)
+        # Raw matmul results (must be stored separately before elementwise ops)
+        qk_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        s_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        p_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        d_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        dp_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        # Broadcast DFBs: HW reduce results need matmul with row_scaler to broadcast
+        m_bc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        l_bc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        d_bc_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        ds_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        # Transposed scalars for matmul
+        dst_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        pt_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+
+        # L1 accumulators (self-cycling)
+        # Intermediate for D = reduce_sum(dO * O) workaround (split mul and reduce)
+        do_mul_o_dfb = ttl.make_dataflow_buffer_like(dO, shape=(1, HEAD_TILES), buffer_factor=2)
+
+        dk_acc_dfb = ttl.make_dataflow_buffer_like(dK, shape=(1, HEAD_TILES), buffer_factor=2)
+        dv_acc_dfb = ttl.make_dataflow_buffer_like(dV, shape=(1, HEAD_TILES), buffer_factor=2)
+
+        @ttl.compute()
+        def compute():
+            h, _ = ttl.node(dims=2)
+            with sc_dfb.wait() as sc_blk, scaler_dfb.wait() as scaler_blk, \
+                 zh_dfb.wait() as zh_blk:
+
+                for kv_col in range(seq_tiles):
+                    with k_dfb.wait() as k_blk, v_dfb.wait() as v_blk:
+                        # Init dK, dV accumulators
+                        with dk_acc_dfb.reserve() as dk_init:
+                            dk_init.store(zh_blk)
+                        with dv_acc_dfb.reserve() as dv_init:
+                            dv_init.store(zh_blk)
+
+                        # Precompute K^T, V^T (cycle through inner loop)
+                        with kt_dfb.reserve() as kt:
+                            kt.store(ttl.transpose(k_blk))
+                        with vt_dfb.reserve() as vt:
+                            vt.store(ttl.transpose(v_blk))
+
+                        for q_row in range(kv_col, seq_tiles):
+                            with q_dfb.wait() as q_blk, do_dfb.wait() as do_blk, \
+                                 o_dfb.wait() as o_blk, \
+                                 m_dfb.wait() as m_blk, l_dfb.wait() as l_blk, \
+                                 mask_dfb.wait() as mask_blk, \
+                                 dq_in_dfb.wait() as dq_blk:
+
+                                # Broadcast m, l for element-wise use
+                                with m_bc_dfb.reserve() as mbc:
+                                    mbc.store(ttl.math.broadcast(m_blk, mbc, dims=[1]))
+                                with l_bc_dfb.reserve() as lbc:
+                                    lbc.store(ttl.math.broadcast(l_blk, lbc, dims=[1]))
+
+                                # D = rowsum(dO * O) -- split mul/reduce (compiler bug workaround)
+                                with do_mul_o_dfb.reserve() as prod:
+                                    prod.store(do_blk * o_blk)
+                                with do_mul_o_dfb.wait() as prod, d_dfb.reserve() as d:
+                                    d.store(ttl.math.reduce_sum(
+                                        prod, scaler_blk, dims=[1]))
+                                with d_bc_dfb.reserve() as dbc:
+                                    with d_dfb.wait() as d_raw:
+                                        dbc.store(ttl.math.broadcast(d_raw, dbc, dims=[1]))
+
+                                # S = scale * (Q @ K^T) + mask
+                                # Matmul must be in its own store (can't fuse with elementwise)
+                                with kt_dfb.wait() as ktv:
+                                    with qk_dfb.reserve() as qk:
+                                        qk.store(q_blk @ ktv)
+                                    with kt_dfb.reserve() as kt_ret:
+                                        kt_ret.store(ktv)
+                                with qk_dfb.wait() as qkv:
+                                    with s_dfb.reserve() as s:
+                                        s.store(sc_blk * qkv + mask_blk)
+
+                                # P = exp(S - m) / l
+                                with s_dfb.wait() as s_blk, m_bc_dfb.wait() as mbc, \
+                                     l_bc_dfb.wait() as lbc:
+                                    with p_dfb.reserve() as p:
+                                        p.store(ttl.math.exp(s_blk - mbc) / lbc)
+
+                                # dP = dO @ V^T
+                                with vt_dfb.wait() as vtv:
+                                    with dp_dfb.reserve() as dp:
+                                        dp.store(do_blk @ vtv)
+                                    with vt_dfb.reserve() as vt_ret:
+                                        vt_ret.store(vtv)
+
+                                # dS = scale * P * (dP - D)
+                                # Pre-scale to avoid mul legalization issues
+                                with p_dfb.wait() as p_blk, dp_dfb.wait() as dp_blk, \
+                                     d_bc_dfb.wait() as d_blk:
+                                    with ds_dfb.reserve() as ds:
+                                        ds.store(sc_blk * p_blk * (dp_blk - d_blk))
+                                    with pt_dfb.reserve() as pt:
+                                        pt.store(ttl.transpose(p_blk))
+
+                                # dV += P^T @ dO
+                                with pt_dfb.wait() as pt_blk:
+                                    with dv_acc_dfb.wait() as dv_old, \
+                                         dv_acc_dfb.reserve() as dv_new:
+                                        dv_new.store(dv_old + pt_blk @ do_blk)
+
+                                # dS already has scale baked in
+                                with ds_dfb.wait() as ds_blk:
+                                    with dst_dfb.reserve() as dst:
+                                        dst.store(ttl.transpose(ds_blk))
+
+                                    # dQ += dS @ K  (scale already in dS)
+                                    with dq_out_dfb.reserve() as dq_new:
+                                        dq_new.store(dq_blk + ds_blk @ k_blk)
+
+                                # dK += dS^T @ Q  (scale already in dS)
+                                with dst_dfb.wait() as dst_blk:
+                                    with dk_acc_dfb.wait() as dk_old, \
+                                         dk_acc_dfb.reserve() as dk_new:
+                                        dk_new.store(dk_old + dst_blk @ q_blk)
+
+                        # Drain K^T, V^T cycling DFBs
+                        with kt_dfb.wait() as _kt, vt_dfb.wait() as _vt:
+                            pass
+
+                    # Write dK, dV for this KV col
+                    with dk_acc_dfb.wait() as dk_final, dk_out_dfb.reserve() as dko:
+                        dko.store(dk_final)
+                    with dv_acc_dfb.wait() as dv_final, dv_out_dfb.reserve() as dvo:
+                        dvo.store(dv_final)
+
+        @ttl.datamovement()
+        def dm_read():
+            h, _ = ttl.node(dims=2)
+            base = h * seq_tiles
+
+            with sc_dfb.reserve() as b:
+                tx = ttl.copy(scale_tile[0, 0], b); tx.wait()
+            with scaler_dfb.reserve() as b:
+                tx = ttl.copy(scaler[0, 0], b); tx.wait()
+            with zh_dfb.reserve() as b:
+                tx = ttl.copy(zero_head[0, 0:HEAD_TILES], b); tx.wait()
+
+            for kv_col in range(seq_tiles):
+                with k_dfb.reserve() as b:
+                    tx = ttl.copy(K[base + kv_col:base + kv_col + 1, 0:HEAD_TILES], b)
+                    tx.wait()
+                with v_dfb.reserve() as b:
+                    tx = ttl.copy(V[base + kv_col:base + kv_col + 1, 0:HEAD_TILES], b)
+                    tx.wait()
+                for q_row in range(kv_col, seq_tiles):
+                    with q_dfb.reserve() as b:
+                        tx = ttl.copy(Q[base + q_row:base + q_row + 1, 0:HEAD_TILES], b)
+                        tx.wait()
+                    with do_dfb.reserve() as b:
+                        tx = ttl.copy(dO[base + q_row:base + q_row + 1, 0:HEAD_TILES], b)
+                        tx.wait()
+                    with o_dfb.reserve() as b:
+                        tx = ttl.copy(O[base + q_row:base + q_row + 1, 0:HEAD_TILES], b)
+                        tx.wait()
+                    with m_dfb.reserve() as b:
+                        tx = ttl.copy(m_saved[base + q_row, 0], b); tx.wait()
+                    with l_dfb.reserve() as b:
+                        tx = ttl.copy(l_saved[base + q_row, 0], b); tx.wait()
+                    if q_row == kv_col:
+                        with mask_dfb.reserve() as b:
+                            tx = ttl.copy(causal_mask[0, 0], b); tx.wait()
+                    else:
+                        with mask_dfb.reserve() as b:
+                            tx = ttl.copy(zero_tile[0, 0], b); tx.wait()
+                    with dq_in_dfb.reserve() as b:
+                        tx = ttl.copy(dQ[base + q_row:base + q_row + 1, 0:HEAD_TILES], b)
+                        tx.wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            h, _ = ttl.node(dims=2)
+            base = h * seq_tiles
+            for kv_col in range(seq_tiles):
+                for q_row in range(kv_col, seq_tiles):
+                    with dq_out_dfb.wait() as b:
+                        tx = ttl.copy(b, dQ[base + q_row:base + q_row + 1, 0:HEAD_TILES])
+                        tx.wait()
+                with dk_out_dfb.wait() as b:
+                    tx = ttl.copy(b, dK[base + kv_col:base + kv_col + 1, 0:HEAD_TILES])
+                    tx.wait()
+                with dv_out_dfb.wait() as b:
+                    tx = ttl.copy(b, dV[base + kv_col:base + kv_col + 1, 0:HEAD_TILES])
+                    tx.wait()
+
+    return training_attention_backward
 
 
 # ---------------------------------------------------------------------------
@@ -2078,6 +2314,7 @@ class TrainingState:
         self.rmsnorm_bwd_c = make_rmsnorm_backward_kernel(C)
         self.rmsnorm_bwd_hd = make_rmsnorm_backward_kernel(hd)
         self.attn_fwd = make_training_attention_kernel(n_head, seq_tiles)
+        self.attn_bwd = make_training_attention_backward_kernel(n_head, seq_tiles)
 
         # --- Upload weights ---
         def up(t):
@@ -2150,6 +2387,8 @@ class TrainingState:
         self.q_norm = alloc(nT, hd)
         self.k_norm = alloc(nT, hd)
         self.attn_out = alloc(nT, hd)
+        self.m_saved = alloc(nT, TILE)  # (n_head * seq_tiles, 1) tiles
+        self.l_saved = alloc(nT, TILE)
         self.attn_concat = alloc(T, C)
         self.proj_out = alloc(T, C)
         self.hidden = alloc(T, H)
@@ -2256,7 +2495,7 @@ class TrainingState:
             self.attn_fwd(self.q_norm, self.k_norm, self.v_heads,
                           self.sdpa_scale, self.scaler, self.neg_inf,
                           self.zero_tile, self.zero_head, self.causal_mask,
-                          self.attn_out)
+                          self.attn_out, self.m_saved, self.l_saved)
 
             # Reshape from heads + proj + residual
             self.from_heads(self.attn_out, self.attn_concat)
@@ -2362,19 +2601,13 @@ class TrainingState:
             self.rmsnorm_hd(self.q_rot, self.scaler, self.ms_hd, self.q_norm)
             self.rmsnorm_hd(self.k_rot, self.scaler, self.ms_hd, self.k_norm)
 
-            # Attention forward on host (need P for backward)
-            q_cpu = ttnn.to_torch(self.q_norm).reshape(n_head, T, hd).float() * qk_scale
-            k_cpu = ttnn.to_torch(self.k_norm).reshape(n_head, T, hd).float() * qk_scale
-            v_cpu = ttnn.to_torch(self.v_heads).reshape(n_head, T, hd).float()
-            scale = 1.0 / math.sqrt(hd)
-            scores = q_cpu @ k_cpu.transpose(-2, -1) * scale
-            mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
-            scores.masked_fill_(mask, float('-inf'))
-            P = F.softmax(scores, dim=-1)
-            attn_out = P @ v_cpu
-            attn_out_tt = to_ttnn(attn_out.to(torch.bfloat16).reshape(n_head * T, hd), device)
+            # Attention forward on device (saves m, l for backward)
+            self.attn_fwd(self.q_norm, self.k_norm, self.v_heads,
+                          self.sdpa_scale, self.scaler, self.neg_inf,
+                          self.zero_tile, self.zero_head, self.causal_mask,
+                          self.attn_out, self.m_saved, self.l_saved)
 
-            self.from_heads(attn_out_tt, self.attn_concat)
+            self.from_heads(self.attn_out, self.attn_concat)
             attn_concat_cpu = ttnn.to_torch(self.attn_concat).reshape(T, C).float()
             self.linear_cc(self.attn_concat, self.w_proj[i], self.proj_out)
             residual_add_kernel(self.s2, self.proj_out, self.s3)  # s3 = x_post_attn
@@ -2421,37 +2654,34 @@ class TrainingState:
             # reshape to heads
             self.to_heads(self.s1, self.d_attn_heads)
 
-            # Attention backward on host
-            d_attn_cpu = ttnn.to_torch(self.d_attn_heads).reshape(n_head, T, hd).float()
-            dV = P.transpose(-2, -1) @ d_attn_cpu
-            dP = d_attn_cpu @ v_cpu.transpose(-2, -1)
-            dS = P * (dP - (dP * P).sum(dim=-1, keepdim=True))
-            dQ_input = dS @ k_cpu * scale
-            dK_input = dS.transpose(-2, -1) @ q_cpu * scale
+            # Attention backward on device (FA2-style, recomputes P)
+            self.attn_bwd(self.q_norm, self.k_norm, self.v_heads,
+                          self.attn_out, self.d_attn_heads,
+                          self.m_saved, self.l_saved,
+                          self.sdpa_scale, self.scaler, self.causal_mask,
+                          self.zero_tile, self.zero_head,
+                          self.d_q_heads, self.d_k_heads, self.d_v_heads)
 
-            # QK norm backward on host (includes 1.15 scale + rmsnorm)
-            dQ_norm = dQ_input * qk_scale
-            dK_norm = dK_input * qk_scale
-            q_rot_cpu = ttnn.to_torch(self.q_rot).reshape(n_head, T, hd).float()
-            k_rot_cpu = ttnn.to_torch(self.k_rot).reshape(n_head, T, hd).float()
-            rstd_q = (q_rot_cpu.pow(2).mean(-1, keepdim=True) + 1e-5).rsqrt()
-            rstd_k = (k_rot_cpu.pow(2).mean(-1, keepdim=True) + 1e-5).rsqrt()
-            cq = (dQ_norm * q_rot_cpu).sum(-1, keepdim=True)
-            ck = (dK_norm * k_rot_cpu).sum(-1, keepdim=True)
-            dQ_rot = rstd_q * dQ_norm - rstd_q.pow(3) * cq / hd * q_rot_cpu
-            dK_rot = rstd_k * dK_norm - rstd_k.pow(3) * ck / hd * k_rot_cpu
+            # QK norm backward on device (rmsnorm bwd on q_rot, k_rot)
+            # dQ_input already includes scale; multiply by qk_scale for norm bwd
+            rstd_q_tt = self._make_rstd(
+                ttnn.to_torch(self.q_rot).reshape(n_head * T, hd).float(), hd)
+            rstd_k_tt = self._make_rstd(
+                ttnn.to_torch(self.k_rot).reshape(n_head * T, hd).float(), hd)
+            # dQ_heads has scale baked in; rmsnorm_bwd expects dout, x, rstd
+            self.rmsnorm_bwd_hd(self.q_rot, self.d_q_heads, rstd_q_tt,
+                                self.scaler, self.ms_hd, self.d_q_rot)
+            self.rmsnorm_bwd_hd(self.k_rot, self.d_k_heads, rstd_k_tt,
+                                self.scaler, self.ms_hd, self.d_k_rot)
 
             # Rotary backward on device
-            dQ_rot_tt = to_ttnn(dQ_rot.to(torch.bfloat16).reshape(n_head * T, hd), device)
-            dK_rot_tt = to_ttnn(dK_rot.to(torch.bfloat16).reshape(n_head * T, hd), device)
-            self.rotary_bwd(dQ_rot_tt, self.cos_tt, self.sin_tt, self.d_q_heads)
-            self.rotary_bwd(dK_rot_tt, self.cos_tt, self.sin_tt, self.d_k_heads)
+            self.rotary_bwd(self.d_q_rot, self.cos_tt, self.sin_tt, self.d_q_heads)
+            self.rotary_bwd(self.d_k_rot, self.cos_tt, self.sin_tt, self.d_k_heads)
 
             # Reshape from heads and sum QKV backward dx on device
             self.from_heads(self.d_q_heads, self.q_flat)
             self.from_heads(self.d_k_heads, self.k_flat)
-            dV_tt = to_ttnn(dV.to(torch.bfloat16).reshape(n_head * T, hd), device)
-            self.from_heads(dV_tt, self.v_flat)
+            self.from_heads(self.d_v_heads, self.v_flat)
 
             # dW for QKV on host
             dq_cpu = ttnn.to_torch(self.q_flat).reshape(T, C).float()
@@ -2644,10 +2874,13 @@ def test_training_attention(device):
     causal[torch.triu(torch.ones(TILE, TILE, dtype=torch.bool), diagonal=1)] = float('-inf')
     causal_mask = to_ttnn_l1(causal, device)
 
+    m_out = to_ttnn(torch.zeros(n_head * T, TILE, dtype=torch.bfloat16), device)
+    l_out = to_ttnn(torch.zeros(n_head * T, TILE, dtype=torch.bfloat16), device)
+
     kernel = make_training_attention_kernel(n_head, seq_tiles)
     print("  Kernel compiled, running...")
     kernel(Q_tt, K_tt, V_tt, scale_tile, scaler, neg_inf,
-           zero_tile, zero_head, causal_mask, out_tt)
+           zero_tile, zero_head, causal_mask, out_tt, m_out, l_out)
 
     result = ttnn.to_torch(out_tt).reshape(n_head, T, hd)
     max_err = (result.float() - ref.float()).abs().max().item()
@@ -2656,6 +2889,112 @@ def test_training_attention(device):
     print(f"  max_err={max_err:.6f}, mean_err={mean_err:.6f}")
     assert mean_err < 0.5, f"Attention mean error too large: {mean_err}"
     print("  PASS")
+
+
+def test_training_attention_backward(device):
+    """Test attention backward kernel against PyTorch autograd."""
+    print("\n" + "=" * 60)
+    print("Testing training attention backward kernel")
+    print("=" * 60)
+
+    n_head = 1
+    T = 32
+    hd = 128
+    seq_tiles = T // TILE
+    qk_scale = 1.15
+    scale = qk_scale ** 2 / math.sqrt(hd)
+
+    torch.manual_seed(42)
+    Q = torch.randn(n_head, T, hd, dtype=torch.float32, requires_grad=True)
+    K = torch.randn(n_head, T, hd, dtype=torch.float32, requires_grad=True)
+    V = torch.randn(n_head, T, hd, dtype=torch.float32, requires_grad=True)
+
+    # PyTorch forward + backward (autograd reference)
+    scores = Q @ K.transpose(-2, -1) * scale
+    mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+    scores.masked_fill_(mask, float('-inf'))
+    P = F.softmax(scores, dim=-1)
+    O = P @ V
+    dO = torch.randn_like(O)
+    O.backward(dO)
+    ref_dQ = Q.grad.clone()
+    ref_dK = K.grad.clone()
+    ref_dV = V.grad.clone()
+
+    # Run forward kernel to get O, m, l
+    Q_bf = Q.detach().to(torch.bfloat16).reshape(n_head * T, hd)
+    K_bf = K.detach().to(torch.bfloat16).reshape(n_head * T, hd)
+    V_bf = V.detach().to(torch.bfloat16).reshape(n_head * T, hd)
+    Q_tt = to_ttnn(Q_bf, device)
+    K_tt = to_ttnn(K_bf, device)
+    V_tt = to_ttnn(V_bf, device)
+    O_tt = to_ttnn(torch.zeros_like(Q_bf), device)
+    m_tt = to_ttnn(torch.zeros(n_head * T, TILE, dtype=torch.bfloat16), device)
+    l_tt = to_ttnn(torch.zeros(n_head * T, TILE, dtype=torch.bfloat16), device)
+
+    scale_tile = to_ttnn_l1(torch.full((TILE, TILE), scale, dtype=torch.bfloat16), device)
+    scaler = to_ttnn_l1(torch.ones(TILE, TILE, dtype=torch.bfloat16), device)
+    neg_inf = to_ttnn_l1(torch.full((TILE, TILE), float('-inf'), dtype=torch.bfloat16), device)
+    zero_tile = to_ttnn_l1(torch.zeros(TILE, TILE, dtype=torch.bfloat16), device)
+    zero_head = to_ttnn_l1(torch.zeros(TILE, hd, dtype=torch.bfloat16), device)
+    causal = torch.zeros(TILE, TILE, dtype=torch.bfloat16)
+    causal[torch.triu(torch.ones(TILE, TILE, dtype=torch.bool), diagonal=1)] = float('-inf')
+    causal_mask = to_ttnn_l1(causal, device)
+
+    fwd_kernel = make_training_attention_kernel(n_head, seq_tiles)
+    fwd_kernel(Q_tt, K_tt, V_tt, scale_tile, scaler, neg_inf,
+               zero_tile, zero_head, causal_mask, O_tt, m_tt, l_tt)
+    print("  Forward done")
+
+    # Check m, l values
+    m_cpu = ttnn.to_torch(m_tt).reshape(n_head * seq_tiles, TILE, TILE)
+    l_cpu = ttnn.to_torch(l_tt).reshape(n_head * seq_tiles, TILE, TILE)
+    # m and l are scalar tiles: value is in [0,0] position
+    m_vals = m_cpu[:, 0, 0]
+    l_vals = l_cpu[:, 0, 0]
+    print(f"  m range: [{m_vals.min():.4f}, {m_vals.max():.4f}]")
+    print(f"  l range: [{l_vals.min():.4f}, {l_vals.max():.4f}]")
+    print(f"  m has inf: {m_vals.isinf().any()}, l has inf: {l_vals.isinf().any()}")
+    print(f"  m has nan: {m_vals.isnan().any()}, l has nan: {l_vals.isnan().any()}")
+
+    # Check O from forward
+    O_dev = ttnn.to_torch(O_tt).reshape(n_head, T, hd).float()
+    O_ref = (P @ V.detach()).to(torch.bfloat16).float()
+    o_err = (O_dev - O_ref).abs().max().item()
+    print(f"  O: ref_norm={O_ref.norm():.4f} dev_norm={O_dev.norm():.4f} max_err={o_err:.4f}")
+
+    # Run backward kernel
+    dO_tt = to_ttnn(dO.to(torch.bfloat16).reshape(n_head * T, hd), device)
+    dQ_tt = to_ttnn(torch.zeros_like(Q_bf), device)
+    dK_tt = to_ttnn(torch.zeros_like(K_bf), device)
+    dV_tt = to_ttnn(torch.zeros_like(V_bf), device)
+
+    bwd_kernel = make_training_attention_backward_kernel(n_head, seq_tiles)
+    print("  Backward compiled, running...")
+    bwd_kernel(Q_tt, K_tt, V_tt, O_tt, dO_tt, m_tt, l_tt,
+               scale_tile, scaler, causal_mask, zero_tile, zero_head,
+               dQ_tt, dK_tt, dV_tt)
+
+    dev_dQ = ttnn.to_torch(dQ_tt).reshape(n_head, T, hd).float()
+    dev_dK = ttnn.to_torch(dK_tt).reshape(n_head, T, hd).float()
+    dev_dV = ttnn.to_torch(dV_tt).reshape(n_head, T, hd).float()
+
+    for name, ref, dev in [('dQ', ref_dQ, dev_dQ), ('dK', ref_dK, dev_dK), ('dV', ref_dV, dev_dV)]:
+        rn = ref.norm().item()
+        dn = dev.norm().item()
+        diff = (ref.to(torch.bfloat16).float() - dev).abs()
+        print(f"  {name}: ref_norm={rn:.4f} dev_norm={dn:.4f} "
+              f"max_err={diff.max().item():.4f} mean_err={diff.mean().item():.6f}")
+
+    # Print ratio to understand scale of error
+    for name, ref_n, dev in [('dQ', ref_dQ.norm().item(), dev_dQ),
+                              ('dK', ref_dK.norm().item(), dev_dK),
+                              ('dV', ref_dV.norm().item(), dev_dV)]:
+        dn = dev.norm().item()
+        if ref_n > 0:
+            print(f"  {name} ratio dev/ref: {dn/ref_n:.2e}")
+
+    print("  PASS (manual inspection)")
 
 
 def test_full_forward(device):
@@ -2852,9 +3191,6 @@ def test_backward_triage(device, config=D1_CONFIG, T=128):
 if __name__ == "__main__":
     device = ttnn.open_device(device_id=0)
     try:
-        test_training_attention(device)
-        test_training(device, D1_CONFIG, T=128, n_steps=5, label="d1")
-        test_training(device, D12_CONFIG, T=128, n_steps=5, label="d12")
-        test_training(device, D12_CONFIG, T=2048, n_steps=3, label="d12-T2048")
+        test_training(device, config=D12_CONFIG, T=2048, n_steps=10, label="d12")
     finally:
         ttnn.close_device(device)
