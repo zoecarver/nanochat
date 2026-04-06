@@ -1278,6 +1278,170 @@ def make_rmsnorm_backward_kernel(n_dim):
 
 
 # ---------------------------------------------------------------------------
+# TT-Lang: Training flash attention (causal, one core per head)
+# ---------------------------------------------------------------------------
+HEAD_TILES = 4  # head_dim // TILE = 128 // 32
+
+def make_training_attention_kernel(n_head, seq_tiles):
+    """Flash attention for training: full causal attention.
+    Q, K: (n_head * seq_tiles, HEAD_TILES) tiles -- after QK norm + scale
+    V: (n_head * seq_tiles, HEAD_TILES) tiles
+    out: same shape as V
+    """
+    @ttl.operation(grid=(n_head, 1))
+    def training_attention(Q, K, V, scale_tile, scaler, neg_inf_tile,
+                           zero_tile, zero_head, causal_mask, out):
+        q_dfb = ttl.make_dataflow_buffer_like(Q, shape=(1, HEAD_TILES), buffer_factor=2)
+        k_dfb = ttl.make_dataflow_buffer_like(K, shape=(1, HEAD_TILES), buffer_factor=2)
+        v_dfb = ttl.make_dataflow_buffer_like(V, shape=(1, HEAD_TILES), buffer_factor=2)
+        sc_dfb = ttl.make_dataflow_buffer_like(scale_tile, shape=(1, 1), buffer_factor=1)
+        scaler_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=1)
+        ninf_dfb = ttl.make_dataflow_buffer_like(neg_inf_tile, shape=(1, 1), buffer_factor=1)
+        zero_dfb = ttl.make_dataflow_buffer_like(zero_tile, shape=(1, 1), buffer_factor=1)
+        zh_dfb = ttl.make_dataflow_buffer_like(zero_head, shape=(1, HEAD_TILES), buffer_factor=1)
+        mask_dfb = ttl.make_dataflow_buffer_like(causal_mask, shape=(1, 1), buffer_factor=2)
+
+        kt_dfb = ttl.make_dataflow_buffer_like(K, shape=(HEAD_TILES, 1), buffer_factor=2)
+        qk_dfb = ttl.make_dataflow_buffer_like(Q, shape=(1, 1), buffer_factor=2)
+        scaled_dfb = ttl.make_dataflow_buffer_like(Q, shape=(1, 1), buffer_factor=2)
+        cm_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        m_new_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        alpha_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        alpha_bc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
+        exp_dfb = ttl.make_dataflow_buffer_like(Q, shape=(1, 1), buffer_factor=2)
+        cs_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        co_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
+
+        m_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        l_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+        o_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
+        l_bc_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
+        out_dfb = ttl.make_dataflow_buffer_like(out, shape=(1, HEAD_TILES), buffer_factor=2)
+
+        # Temp DFB for draining m after inner loop
+        m_drain_dfb = ttl.make_dataflow_buffer_like(scaler, shape=(1, 1), buffer_factor=2)
+
+        @ttl.compute()
+        def compute():
+            h, _ = ttl.node(dims=2)
+            with sc_dfb.wait() as sc_blk, scaler_dfb.wait() as scaler_blk, \
+                 ninf_dfb.wait() as ninf_blk, zero_dfb.wait() as zero_blk, \
+                 zh_dfb.wait() as zh_blk:
+
+                for q_row in range(seq_tiles):
+                    with q_dfb.wait() as q_blk:
+                        # Init running state: m=-inf, l=0, o=0
+                        with m_dfb.reserve() as mi:
+                            mi.store(ninf_blk)
+                        with l_dfb.reserve() as li:
+                            li.store(zero_blk)
+                        with o_dfb.reserve() as oi:
+                            oi.store(zh_blk)
+
+                        for kv_col in range(q_row + 1):
+                            with k_dfb.wait() as kc, kt_dfb.reserve() as kt:
+                                kt.store(ttl.transpose(kc))
+                            with kt_dfb.wait() as ktv, qk_dfb.reserve() as qk:
+                                qk.store(q_blk @ ktv)
+                            with qk_dfb.wait() as qkv, mask_dfb.wait() as mv:
+                                with scaled_dfb.reserve() as scd:
+                                    scd.store(sc_blk * qkv + mv)
+
+                            # Online softmax
+                            with scaled_dfb.wait() as sd:
+                                with cm_dfb.reserve() as cm:
+                                    cm.store(ttl.math.reduce_max(sd, scaler_blk, dims=[1]))
+                                with m_dfb.wait() as m_old:
+                                    with cm_dfb.wait() as cm:
+                                        with m_new_dfb.reserve() as mn:
+                                            mn.store(ttl.math.max(m_old, cm))
+                                    with m_new_dfb.wait() as mn:
+                                        with alpha_dfb.reserve() as alpha:
+                                            alpha.store(ttl.math.exp(m_old - mn))
+                                        with exp_dfb.reserve() as ex:
+                                            ex.store(ttl.math.exp(sd - mn))
+                                        with m_dfb.reserve() as m_next:
+                                            m_next.store(mn)
+
+                            with exp_dfb.wait() as exp_blk:
+                                with cs_dfb.reserve() as cs:
+                                    cs.store(ttl.math.reduce_sum(exp_blk, scaler_blk, dims=[1]))
+                                with alpha_dfb.wait() as alpha_blk:
+                                    with l_dfb.wait() as l_old, cs_dfb.wait() as cs:
+                                        with l_dfb.reserve() as l_new:
+                                            l_new.store(alpha_blk * l_old + cs)
+                                    with alpha_bc_dfb.reserve() as abc:
+                                        abc.store(ttl.math.broadcast(alpha_blk, abc, dims=[1]))
+                                with alpha_bc_dfb.wait() as abc, o_dfb.wait() as o_old:
+                                    with co_dfb.reserve() as co:
+                                        co.store(abc * o_old)
+                                with co_dfb.wait() as co, v_dfb.wait() as vc:
+                                    with o_dfb.reserve() as o_new:
+                                        o_new.store(co + exp_blk @ vc)
+
+                        # Drain m (l and o consumed in normalize below)
+                        with m_dfb.wait() as m_final, m_drain_dfb.reserve() as md:
+                            md.store(m_final)
+
+                    # Normalize: o = o / l
+                    with l_dfb.wait() as l_final, l_bc_dfb.reserve() as lbc:
+                        lbc.store(ttl.math.broadcast(l_final, lbc, dims=[1]))
+                    with o_dfb.wait() as o_final, l_bc_dfb.wait() as lbc:
+                        with out_dfb.reserve() as o:
+                            o.store(o_final / lbc)
+
+        @ttl.datamovement()
+        def dm_read():
+            h, _ = ttl.node(dims=2)
+            kv_base = h * seq_tiles
+            # Load constants
+            with sc_dfb.reserve() as b:
+                tx = ttl.copy(scale_tile[0, 0], b); tx.wait()
+            with scaler_dfb.reserve() as b:
+                tx = ttl.copy(scaler[0, 0], b); tx.wait()
+            with ninf_dfb.reserve() as b:
+                tx = ttl.copy(neg_inf_tile[0, 0], b); tx.wait()
+            with zero_dfb.reserve() as b:
+                tx = ttl.copy(zero_tile[0, 0], b); tx.wait()
+            with zh_dfb.reserve() as b:
+                tx = ttl.copy(zero_head[0, 0:HEAD_TILES], b); tx.wait()
+
+            for q_row in range(seq_tiles):
+                # Load Q for this row
+                with q_dfb.reserve() as b:
+                    tx = ttl.copy(Q[kv_base + q_row:kv_base + q_row + 1, 0:HEAD_TILES], b)
+                    tx.wait()
+                for kv_col in range(q_row + 1):
+                    # Load K, V, mask
+                    with k_dfb.reserve() as b:
+                        tx = ttl.copy(K[kv_base + kv_col:kv_base + kv_col + 1, 0:HEAD_TILES], b)
+                        tx.wait()
+                    with v_dfb.reserve() as b:
+                        tx = ttl.copy(V[kv_base + kv_col:kv_base + kv_col + 1, 0:HEAD_TILES], b)
+                        tx.wait()
+                    if kv_col == q_row:
+                        with mask_dfb.reserve() as b:
+                            tx = ttl.copy(causal_mask[0, 0], b); tx.wait()
+                    else:
+                        with mask_dfb.reserve() as b:
+                            tx = ttl.copy(zero_tile[0, 0], b); tx.wait()
+
+        @ttl.datamovement()
+        def dm_write():
+            h, _ = ttl.node(dims=2)
+            out_base = h * seq_tiles
+            for q_row in range(seq_tiles):
+                # Drain the m accumulator (written by compute, discard)
+                with m_drain_dfb.wait() as _discard:
+                    pass
+                with out_dfb.wait() as b:
+                    tx = ttl.copy(b, out[out_base + q_row:out_base + q_row + 1, 0:HEAD_TILES])
+                    tx.wait()
+
+    return training_attention
+
+
+# ---------------------------------------------------------------------------
 # TT-Lang kernel tests at training shapes
 # ---------------------------------------------------------------------------
 def test_linear_kernel(device):
@@ -1913,6 +2077,7 @@ class TrainingState:
         self.linear_bwd_dw = make_linear_backward_dw_kernel(T // TILE)
         self.rmsnorm_bwd_c = make_rmsnorm_backward_kernel(C)
         self.rmsnorm_bwd_hd = make_rmsnorm_backward_kernel(hd)
+        self.attn_fwd = make_training_attention_kernel(n_head, seq_tiles)
 
         # --- Upload weights ---
         def up(t):
@@ -1955,6 +2120,18 @@ class TrainingState:
         self.cos_tt = up(cos.squeeze(0).squeeze(1))
         self.sin_tt = up(sin.squeeze(0).squeeze(1))
 
+        # Attention constants
+        sdpa_scale = config.qk_scale ** 2 / math.sqrt(hd)
+        self.sdpa_scale = to_ttnn_l1(torch.full((TILE, TILE), sdpa_scale,
+                                     dtype=torch.bfloat16), device)
+        self.neg_inf = to_ttnn_l1(torch.full((TILE, TILE), float('-inf'),
+                                  dtype=torch.bfloat16), device)
+        self.zero_tile = to_ttnn_l1(torch.zeros(TILE, TILE, dtype=torch.bfloat16), device)
+        self.zero_head = to_ttnn_l1(torch.zeros(TILE, hd, dtype=torch.bfloat16), device)
+        causal = torch.zeros(TILE, TILE, dtype=torch.bfloat16)
+        causal[torch.triu(torch.ones(TILE, TILE, dtype=torch.bool), diagonal=1)] = float('-inf')
+        self.causal_mask = to_ttnn_l1(causal, device)
+
         # --- Scratch tensors ---
         def alloc(r, c):
             return to_ttnn(torch.zeros(r, c, dtype=torch.bfloat16), device)
@@ -1972,6 +2149,7 @@ class TrainingState:
         self.k_rot = alloc(nT, hd)
         self.q_norm = alloc(nT, hd)
         self.k_norm = alloc(nT, hd)
+        self.attn_out = alloc(nT, hd)
         self.attn_concat = alloc(T, C)
         self.proj_out = alloc(T, C)
         self.hidden = alloc(T, H)
@@ -2074,21 +2252,14 @@ class TrainingState:
             self.rmsnorm_hd(self.q_rot, self.scaler, self.ms_hd, self.q_norm)
             self.rmsnorm_hd(self.k_rot, self.scaler, self.ms_hd, self.k_norm)
 
-            # Attention on host (with 1.15 scale)
-            qk_scale = self.config.qk_scale
-            q_cpu = ttnn.to_torch(self.q_norm).reshape(n_head, T, hd).float() * qk_scale
-            k_cpu = ttnn.to_torch(self.k_norm).reshape(n_head, T, hd).float() * qk_scale
-            v_cpu = ttnn.to_torch(self.v_heads).reshape(n_head, T, hd).float()
-            scale = 1.0 / math.sqrt(hd)
-            scores = q_cpu @ k_cpu.transpose(-2, -1) * scale
-            mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
-            scores.masked_fill_(mask, float('-inf'))
-            P = F.softmax(scores, dim=-1)
-            attn_out_cpu = (P @ v_cpu).to(torch.bfloat16).reshape(n_head * T, hd)
-            attn_out_tt = to_ttnn(attn_out_cpu, device)
+            # Flash attention on device (causal, scale includes qk_scale^2/sqrt(hd))
+            self.attn_fwd(self.q_norm, self.k_norm, self.v_heads,
+                          self.sdpa_scale, self.scaler, self.neg_inf,
+                          self.zero_tile, self.zero_head, self.causal_mask,
+                          self.attn_out)
 
             # Reshape from heads + proj + residual
-            self.from_heads(attn_out_tt, self.attn_concat)
+            self.from_heads(self.attn_out, self.attn_concat)
             self.linear_cc(self.attn_concat, self.w_proj[i], self.proj_out)
             residual_add_kernel(x_tt, self.proj_out, self.s3)
             x_tt = self.s3
@@ -2433,6 +2604,60 @@ class TrainingState:
                         lr * m_hat / (v_hat.sqrt() + 1e-8)).to(torch.bfloat16)
 
 
+def test_training_attention(device):
+    """Test training attention kernel against PyTorch reference."""
+    print("\n" + "=" * 60)
+    print("Testing training attention kernel")
+    print("=" * 60)
+
+    n_head = 6
+    T = 64  # small for quick testing (2 tiles)
+    hd = 128
+    seq_tiles = T // TILE
+    qk_scale = 1.15
+    scale = qk_scale ** 2 / math.sqrt(hd)
+
+    torch.manual_seed(42)
+    Q = torch.randn(n_head, T, hd, dtype=torch.float32)
+    K = torch.randn(n_head, T, hd, dtype=torch.float32)
+    V = torch.randn(n_head, T, hd, dtype=torch.float32)
+
+    # PyTorch reference
+    scores = Q @ K.transpose(-2, -1) * scale
+    mask = torch.triu(torch.ones(T, T, dtype=torch.bool), diagonal=1)
+    scores.masked_fill_(mask, float('-inf'))
+    P = F.softmax(scores, dim=-1)
+    ref = (P @ V).to(torch.bfloat16)
+
+    # Device kernel
+    Q_tt = to_ttnn(Q.to(torch.bfloat16).reshape(n_head * T, hd), device)
+    K_tt = to_ttnn(K.to(torch.bfloat16).reshape(n_head * T, hd), device)
+    V_tt = to_ttnn(V.to(torch.bfloat16).reshape(n_head * T, hd), device)
+    out_tt = to_ttnn(torch.zeros(n_head * T, hd, dtype=torch.bfloat16), device)
+
+    scale_tile = to_ttnn_l1(torch.full((TILE, TILE), scale, dtype=torch.bfloat16), device)
+    scaler = to_ttnn_l1(torch.ones(TILE, TILE, dtype=torch.bfloat16), device)
+    neg_inf = to_ttnn_l1(torch.full((TILE, TILE), float('-inf'), dtype=torch.bfloat16), device)
+    zero_tile = to_ttnn_l1(torch.zeros(TILE, TILE, dtype=torch.bfloat16), device)
+    zero_head = to_ttnn_l1(torch.zeros(TILE, hd, dtype=torch.bfloat16), device)
+    causal = torch.zeros(TILE, TILE, dtype=torch.bfloat16)
+    causal[torch.triu(torch.ones(TILE, TILE, dtype=torch.bool), diagonal=1)] = float('-inf')
+    causal_mask = to_ttnn_l1(causal, device)
+
+    kernel = make_training_attention_kernel(n_head, seq_tiles)
+    print("  Kernel compiled, running...")
+    kernel(Q_tt, K_tt, V_tt, scale_tile, scaler, neg_inf,
+           zero_tile, zero_head, causal_mask, out_tt)
+
+    result = ttnn.to_torch(out_tt).reshape(n_head, T, hd)
+    max_err = (result.float() - ref.float()).abs().max().item()
+    mean_err = (result.float() - ref.float()).abs().mean().item()
+    print(f"  shape: ({n_head}, {T}, {hd})")
+    print(f"  max_err={max_err:.6f}, mean_err={mean_err:.6f}")
+    assert mean_err < 0.5, f"Attention mean error too large: {mean_err}"
+    print("  PASS")
+
+
 def test_full_forward(device):
     """Test full forward pass on d1: TT loss matches PyTorch."""
     print("\n" + "=" * 60)
@@ -2627,7 +2852,9 @@ def test_backward_triage(device, config=D1_CONFIG, T=128):
 if __name__ == "__main__":
     device = ttnn.open_device(device_id=0)
     try:
+        test_training_attention(device)
         test_training(device, D1_CONFIG, T=128, n_steps=5, label="d1")
+        test_training(device, D12_CONFIG, T=128, n_steps=5, label="d12")
         test_training(device, D12_CONFIG, T=2048, n_steps=3, label="d12-T2048")
     finally:
         ttnn.close_device(device)
