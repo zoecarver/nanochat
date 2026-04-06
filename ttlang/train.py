@@ -2349,7 +2349,7 @@ def test_training(device, config=D1_CONFIG, T=128, n_steps=5, label="d1"):
                            ['w_q', 'w_k', 'w_v', 'w_proj', 'w_fc', 'w_mlp_proj']])
 
     losses = []
-    for step in range(5):
+    for step in range(n_steps):
         loss, saved_x, x0_cpu, dlogits = state.forward(input_ids, targets)
         losses.append(loss)
         print(f"  step {step}: loss={loss:.4f}")
@@ -2409,7 +2409,6 @@ def test_training(device, config=D1_CONFIG, T=128, n_steps=5, label="d1"):
 if __name__ == "__main__":
     device = ttnn.open_device(device_id=0)
     try:
-        test_training(device, D1_CONFIG, T=128, n_steps=5, label="d1")
-        test_training(device, D4_CONFIG, T=128, n_steps=5, label="d4")
+        test_training(device, D12_CONFIG, T=2048, n_steps=10, label="d12-T2048")
     finally:
         ttnn.close_device(device)
