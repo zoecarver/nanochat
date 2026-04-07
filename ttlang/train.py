@@ -714,11 +714,11 @@ HEAD_TILES = HEAD_DIM // TILE   # 4
 HALF_TILES = HALF_DIM // TILE   # 2
 
 
-def make_rotary_training_kernel(n_head, seq_tiles):
+def make_rotary_training_kernel(n_head, seq_tiles, B=1):
     @ttl.operation(grid="auto")
     def rotary_training_kernel(x, cos, sin, out):
         grid_cols, _ = ttl.grid_size(dims=2)
-        total_seq_tiles = n_head * seq_tiles
+        total_seq_tiles = B * n_head * seq_tiles
         tiles_per_core = -(-total_seq_tiles // grid_cols)
 
         x1_dfb = ttl.make_dataflow_buffer_like(x, shape=(1, 1), buffer_factor=2)
@@ -1041,11 +1041,11 @@ def relu_sq_backward_kernel(x, dout, out):
 # ---------------------------------------------------------------------------
 # TT-Lang: Rotary backward: dx1 = dy1*cos - dy2*sin, dx2 = dy1*sin + dy2*cos
 # ---------------------------------------------------------------------------
-def make_rotary_backward_kernel(n_head, seq_tiles):
+def make_rotary_backward_kernel(n_head, seq_tiles, B=1):
     @ttl.operation(grid="auto")
     def rotary_backward_kernel(dout, cos, sin, dx):
         grid_cols, _ = ttl.grid_size(dims=2)
-        total_seq_tiles = n_head * seq_tiles
+        total_seq_tiles = B * n_head * seq_tiles
         tiles_per_core = -(-total_seq_tiles // grid_cols)
 
         dy1_dfb = ttl.make_dataflow_buffer_like(dout, shape=(1, 1), buffer_factor=2)
@@ -1282,13 +1282,14 @@ def make_rmsnorm_backward_kernel(n_dim):
 # ---------------------------------------------------------------------------
 HEAD_TILES = 4  # head_dim // TILE = 128 // 32
 
-def make_training_attention_kernel(n_head, seq_tiles):
+def make_training_attention_kernel(n_head, seq_tiles, B=1):
     """Flash attention for training: full causal attention.
-    Q, K: (n_head * seq_tiles, HEAD_TILES) tiles -- after QK norm + scale
-    V: (n_head * seq_tiles, HEAD_TILES) tiles
+    Q, K: (n_head * B * seq_tiles, HEAD_TILES) tiles -- after QK norm + scale
+    V: (n_head * B * seq_tiles, HEAD_TILES) tiles
     out: same shape as V
+    Grid: (n_head, B) -- one core per (head, batch) pair.
     """
-    @ttl.operation(grid=(n_head, 1))
+    @ttl.operation(grid=(n_head, B))
     def training_attention(Q, K, V, scale_tile, scaler, neg_inf_tile,
                            zero_tile, zero_head, causal_mask,
                            out, m_out, l_out):
@@ -1323,7 +1324,7 @@ def make_training_attention_kernel(n_head, seq_tiles):
 
         @ttl.compute()
         def compute():
-            h, _ = ttl.node(dims=2)
+            h, b = ttl.node(dims=2)
             with sc_dfb.wait() as sc_blk, scaler_dfb.wait() as scaler_blk, \
                  ninf_dfb.wait() as ninf_blk, zero_dfb.wait() as zero_blk, \
                  zh_dfb.wait() as zh_blk:
@@ -1394,8 +1395,8 @@ def make_training_attention_kernel(n_head, seq_tiles):
 
         @ttl.datamovement()
         def dm_read():
-            h, _ = ttl.node(dims=2)
-            kv_base = h * seq_tiles
+            h, b = ttl.node(dims=2)
+            kv_base = h * B * seq_tiles + b * seq_tiles
             # Load constants
             with sc_dfb.reserve() as b:
                 tx = ttl.copy(scale_tile[0, 0], b); tx.wait()
@@ -1430,15 +1431,15 @@ def make_training_attention_kernel(n_head, seq_tiles):
 
         @ttl.datamovement()
         def dm_write():
-            h, _ = ttl.node(dims=2)
-            out_base = h * seq_tiles
+            h, b = ttl.node(dims=2)
+            out_base = h * B * seq_tiles + b * seq_tiles
             for q_row in range(seq_tiles):
-                with m_out_dfb.wait() as b:
-                    tx = ttl.copy(b, m_out[out_base + q_row, 0]); tx.wait()
-                with l_out_dfb.wait() as b:
-                    tx = ttl.copy(b, l_out[out_base + q_row, 0]); tx.wait()
-                with out_dfb.wait() as b:
-                    tx = ttl.copy(b, out[out_base + q_row:out_base + q_row + 1, 0:HEAD_TILES])
+                with m_out_dfb.wait() as blk:
+                    tx = ttl.copy(blk, m_out[out_base + q_row, 0]); tx.wait()
+                with l_out_dfb.wait() as blk:
+                    tx = ttl.copy(blk, l_out[out_base + q_row, 0]); tx.wait()
+                with out_dfb.wait() as blk:
+                    tx = ttl.copy(blk, out[out_base + q_row:out_base + q_row + 1, 0:HEAD_TILES])
                     tx.wait()
 
     return training_attention
@@ -1447,7 +1448,7 @@ def make_training_attention_kernel(n_head, seq_tiles):
 # ---------------------------------------------------------------------------
 # TT-Lang: Training attention backward (FA2-style, recompute P in L1)
 # ---------------------------------------------------------------------------
-def make_training_attention_backward_kernel(n_head, seq_tiles):
+def make_training_attention_backward_kernel(n_head, seq_tiles, B=1):
     """FA2-style attention backward. Recomputes P block-by-block in L1.
     Outer loop over KV cols, inner over Q rows (causal).
     dK, dV accumulate in L1. dQ via read-modify-write from DRAM.
@@ -1455,8 +1456,9 @@ def make_training_attention_backward_kernel(n_head, seq_tiles):
 
     All (1,1) tile scalar-to-vector ops use matmul: (1,1) @ (1, HEAD_TILES).
     K^T, V^T precomputed per KV col and cycled through the inner loop.
+    Grid: (n_head, B) -- one core per (head, batch) pair.
     """
-    @ttl.operation(grid=(n_head, 1))
+    @ttl.operation(grid=(n_head, B))
     def training_attention_backward(Q, K, V, O, dO, m_saved, l_saved,
                                      scale_tile, scaler, causal_mask,
                                      zero_tile, zero_head,
@@ -1510,7 +1512,7 @@ def make_training_attention_backward_kernel(n_head, seq_tiles):
 
         @ttl.compute()
         def compute():
-            h, _ = ttl.node(dims=2)
+            h, b = ttl.node(dims=2)
             with sc_dfb.wait() as sc_blk, scaler_dfb.wait() as scaler_blk, \
                  zh_dfb.wait() as zh_blk:
 
@@ -1617,51 +1619,51 @@ def make_training_attention_backward_kernel(n_head, seq_tiles):
 
         @ttl.datamovement()
         def dm_read():
-            h, _ = ttl.node(dims=2)
-            base = h * seq_tiles
+            h, b = ttl.node(dims=2)
+            base = h * B * seq_tiles + b * seq_tiles
 
-            with sc_dfb.reserve() as b:
-                tx = ttl.copy(scale_tile[0, 0], b); tx.wait()
-            with scaler_dfb.reserve() as b:
-                tx = ttl.copy(scaler[0, 0], b); tx.wait()
-            with zh_dfb.reserve() as b:
-                tx = ttl.copy(zero_head[0, 0:HEAD_TILES], b); tx.wait()
+            with sc_dfb.reserve() as blk:
+                tx = ttl.copy(scale_tile[0, 0], blk); tx.wait()
+            with scaler_dfb.reserve() as blk:
+                tx = ttl.copy(scaler[0, 0], blk); tx.wait()
+            with zh_dfb.reserve() as blk:
+                tx = ttl.copy(zero_head[0, 0:HEAD_TILES], blk); tx.wait()
 
             for kv_col in range(seq_tiles):
-                with k_dfb.reserve() as b:
-                    tx = ttl.copy(K[base + kv_col:base + kv_col + 1, 0:HEAD_TILES], b)
+                with k_dfb.reserve() as blk:
+                    tx = ttl.copy(K[base + kv_col:base + kv_col + 1, 0:HEAD_TILES], blk)
                     tx.wait()
-                with v_dfb.reserve() as b:
-                    tx = ttl.copy(V[base + kv_col:base + kv_col + 1, 0:HEAD_TILES], b)
+                with v_dfb.reserve() as blk:
+                    tx = ttl.copy(V[base + kv_col:base + kv_col + 1, 0:HEAD_TILES], blk)
                     tx.wait()
                 for q_row in range(kv_col, seq_tiles):
-                    with q_dfb.reserve() as b:
-                        tx = ttl.copy(Q[base + q_row:base + q_row + 1, 0:HEAD_TILES], b)
+                    with q_dfb.reserve() as blk:
+                        tx = ttl.copy(Q[base + q_row:base + q_row + 1, 0:HEAD_TILES], blk)
                         tx.wait()
-                    with do_dfb.reserve() as b:
-                        tx = ttl.copy(dO[base + q_row:base + q_row + 1, 0:HEAD_TILES], b)
+                    with do_dfb.reserve() as blk:
+                        tx = ttl.copy(dO[base + q_row:base + q_row + 1, 0:HEAD_TILES], blk)
                         tx.wait()
-                    with o_dfb.reserve() as b:
-                        tx = ttl.copy(O[base + q_row:base + q_row + 1, 0:HEAD_TILES], b)
+                    with o_dfb.reserve() as blk:
+                        tx = ttl.copy(O[base + q_row:base + q_row + 1, 0:HEAD_TILES], blk)
                         tx.wait()
-                    with m_dfb.reserve() as b:
-                        tx = ttl.copy(m_saved[base + q_row, 0], b); tx.wait()
-                    with l_dfb.reserve() as b:
-                        tx = ttl.copy(l_saved[base + q_row, 0], b); tx.wait()
+                    with m_dfb.reserve() as blk:
+                        tx = ttl.copy(m_saved[base + q_row, 0], blk); tx.wait()
+                    with l_dfb.reserve() as blk:
+                        tx = ttl.copy(l_saved[base + q_row, 0], blk); tx.wait()
                     if q_row == kv_col:
-                        with mask_dfb.reserve() as b:
-                            tx = ttl.copy(causal_mask[0, 0], b); tx.wait()
+                        with mask_dfb.reserve() as blk:
+                            tx = ttl.copy(causal_mask[0, 0], blk); tx.wait()
                     else:
-                        with mask_dfb.reserve() as b:
-                            tx = ttl.copy(zero_tile[0, 0], b); tx.wait()
-                    with dq_in_dfb.reserve() as b:
-                        tx = ttl.copy(dQ[base + q_row:base + q_row + 1, 0:HEAD_TILES], b)
+                        with mask_dfb.reserve() as blk:
+                            tx = ttl.copy(zero_tile[0, 0], blk); tx.wait()
+                    with dq_in_dfb.reserve() as blk:
+                        tx = ttl.copy(dQ[base + q_row:base + q_row + 1, 0:HEAD_TILES], blk)
                         tx.wait()
 
         @ttl.datamovement()
         def dm_write():
-            h, _ = ttl.node(dims=2)
-            base = h * seq_tiles
+            h, b = ttl.node(dims=2)
+            base = h * B * seq_tiles + b * seq_tiles
             for kv_col in range(seq_tiles):
                 for q_row in range(kv_col, seq_tiles):
                     with dq_out_dfb.wait() as b:
@@ -2288,16 +2290,18 @@ def make_adamw_constants(lr, beta1, beta2, wd, step, device):
 class TrainingState:
     """Holds all device tensors and kernels for training."""
 
-    def __init__(self, config, model, device, T=2048):
+    def __init__(self, config, model, device, T=2048, B=1):
         self.config = config
         self.device = device
         self.T = T
+        self.B = B
         C = config.n_embd
         H = config.mlp_hidden
         V = config.vocab_size
         n_head = config.n_head
         hd = config.head_dim
         seq_tiles = T // TILE
+        BT = B * T
 
         # --- Kernel instances ---
         self.linear_cc = make_linear_kernel(C // TILE)
@@ -2306,15 +2310,15 @@ class TrainingState:
         self.linear_cv = make_linear_kernel(C // TILE)
         self.rmsnorm_c = make_rmsnorm_kernel(C)
         self.rmsnorm_hd = make_rmsnorm_kernel(hd)
-        self.rotary_fwd = make_rotary_training_kernel(n_head, seq_tiles)
-        self.rotary_bwd = make_rotary_backward_kernel(n_head, seq_tiles)
-        self.to_heads = make_reshape_to_heads_kernel(n_head, seq_tiles)
-        self.from_heads = make_reshape_from_heads_kernel(n_head, seq_tiles)
-        self.linear_bwd_dw = make_linear_backward_dw_kernel(T // TILE)
+        self.rotary_fwd = make_rotary_training_kernel(n_head, seq_tiles, B=B)
+        self.rotary_bwd = make_rotary_backward_kernel(n_head, seq_tiles, B=B)
+        self.to_heads = make_reshape_to_heads_kernel(n_head, B * seq_tiles)
+        self.from_heads = make_reshape_from_heads_kernel(n_head, B * seq_tiles)
+        self.linear_bwd_dw = make_linear_backward_dw_kernel(BT // TILE)
         self.rmsnorm_bwd_c = make_rmsnorm_backward_kernel(C)
         self.rmsnorm_bwd_hd = make_rmsnorm_backward_kernel(hd)
-        self.attn_fwd = make_training_attention_kernel(n_head, seq_tiles)
-        self.attn_bwd = make_training_attention_backward_kernel(n_head, seq_tiles)
+        self.attn_fwd = make_training_attention_kernel(n_head, seq_tiles, B=B)
+        self.attn_bwd = make_training_attention_backward_kernel(n_head, seq_tiles, B=B)
 
         # --- Upload weights ---
         def up(t):
@@ -2372,43 +2376,43 @@ class TrainingState:
         # --- Scratch tensors ---
         def alloc(r, c):
             return to_ttnn(torch.zeros(r, c, dtype=torch.bfloat16), device)
-        nT = n_head * T
-        self.s1 = alloc(T, C)
-        self.s2 = alloc(T, C)
-        self.s3 = alloc(T, C)
-        self.q_flat = alloc(T, C)
-        self.k_flat = alloc(T, C)
-        self.v_flat = alloc(T, C)
-        self.q_heads = alloc(nT, hd)
-        self.k_heads = alloc(nT, hd)
-        self.v_heads = alloc(nT, hd)
-        self.q_rot = alloc(nT, hd)
-        self.k_rot = alloc(nT, hd)
-        self.q_norm = alloc(nT, hd)
-        self.k_norm = alloc(nT, hd)
-        self.attn_out = alloc(nT, hd)
-        self.m_saved = alloc(nT, TILE)  # (n_head * seq_tiles, 1) tiles
-        self.l_saved = alloc(nT, TILE)
-        self.attn_concat = alloc(T, C)
-        self.proj_out = alloc(T, C)
-        self.hidden = alloc(T, H)
-        self.hidden_act = alloc(T, H)
-        self.mlp_out = alloc(T, C)
+        nBT = n_head * BT
+        self.s1 = alloc(BT, C)
+        self.s2 = alloc(BT, C)
+        self.s3 = alloc(BT, C)
+        self.q_flat = alloc(BT, C)
+        self.k_flat = alloc(BT, C)
+        self.v_flat = alloc(BT, C)
+        self.q_heads = alloc(nBT, hd)
+        self.k_heads = alloc(nBT, hd)
+        self.v_heads = alloc(nBT, hd)
+        self.q_rot = alloc(nBT, hd)
+        self.k_rot = alloc(nBT, hd)
+        self.q_norm = alloc(nBT, hd)
+        self.k_norm = alloc(nBT, hd)
+        self.attn_out = alloc(nBT, hd)
+        self.m_saved = alloc(nBT, TILE)
+        self.l_saved = alloc(nBT, TILE)
+        self.attn_concat = alloc(BT, C)
+        self.proj_out = alloc(BT, C)
+        self.hidden = alloc(BT, H)
+        self.hidden_act = alloc(BT, H)
+        self.mlp_out = alloc(BT, C)
         Vp = pad_to_tile(V)
-        self.logits = alloc(T, Vp)
-        self.logits_capped = alloc(T, Vp)
+        self.logits = alloc(BT, Vp)
+        self.logits_capped = alloc(BT, Vp)
         # Backward scratch
-        self.dx = alloc(T, C)
-        self.d_normed = alloc(T, C)
-        self.d_resid = alloc(T, C)  # persists across attention backward
-        self.d_attn_heads = alloc(nT, hd)
-        self.d_q_heads = alloc(nT, hd)
-        self.d_k_heads = alloc(nT, hd)
-        self.d_v_heads = alloc(nT, hd)
-        self.d_q_rot = alloc(nT, hd)
-        self.d_k_rot = alloc(nT, hd)
-        self.d_hidden = alloc(T, H)
-        self.d_hidden_act = alloc(T, H)
+        self.dx = alloc(BT, C)
+        self.d_normed = alloc(BT, C)
+        self.d_resid = alloc(BT, C)  # persists across attention backward
+        self.d_attn_heads = alloc(nBT, hd)
+        self.d_q_heads = alloc(nBT, hd)
+        self.d_k_heads = alloc(nBT, hd)
+        self.d_v_heads = alloc(nBT, hd)
+        self.d_q_rot = alloc(nBT, hd)
+        self.d_k_rot = alloc(nBT, hd)
+        self.d_hidden = alloc(BT, H)
+        self.d_hidden_act = alloc(BT, H)
 
         # Optimizer state and master weights (float32 for precision)
         self.m_state = {}
@@ -2442,16 +2446,20 @@ class TrainingState:
         self.v_state['wte'] = torch.zeros(V, C, dtype=torch.float32)
 
     def forward(self, input_ids, targets):
-        """Full forward pass. Returns (loss, saved_activations)."""
+        """Full forward pass. Returns (loss, saved_activations).
+        input_ids: (B, T), targets: (B, T)
+        """
         T = self.T
+        B = self.B
+        BT = B * T
         C = self.config.n_embd
         V = self.config.vocab_size
         n_head = self.config.n_head
         hd = self.config.head_dim
         device = self.device
 
-        # Embedding on host
-        x_cpu = self.wte_cpu[input_ids.squeeze(0)].contiguous()
+        # Embedding on host: (B, T) -> (B*T, C)
+        x_cpu = self.wte_cpu[input_ids.reshape(-1)].contiguous()
         x_tt = to_ttnn(x_cpu, device)
 
         # Initial RMSNorm
@@ -2459,7 +2467,7 @@ class TrainingState:
         x_tt = self.s1
 
         # Clone x0
-        x0_cpu = ttnn.to_torch(x_tt).reshape(T, C).to(torch.bfloat16)
+        x0_cpu = ttnn.to_torch(x_tt).reshape(BT, C).to(torch.bfloat16)
         x0_tt = to_ttnn(x0_cpu, device)
 
         # Save inter-layer x for gradient checkpointing
@@ -2514,7 +2522,7 @@ class TrainingState:
             x_tt = self.s2
 
             # Save x for gradient checkpointing
-            x_cpu = ttnn.to_torch(x_tt).reshape(T, C).to(torch.bfloat16)
+            x_cpu = ttnn.to_torch(x_tt).reshape(BT, C).to(torch.bfloat16)
             saved_x.append(x_cpu.clone())
 
         # Final RMSNorm
@@ -2525,14 +2533,16 @@ class TrainingState:
         softcap_kernel(self.logits, self.inv_cap, self.cap, self.logits_capped)
 
         # Loss on host
-        logits_cpu = ttnn.to_torch(self.logits_capped).reshape(T, -1)[:, :V].float()
-        loss = F.cross_entropy(logits_cpu, targets.squeeze(0), reduction='mean')
+        logits_cpu = ttnn.to_torch(self.logits_capped).reshape(BT, -1)[:, :V].float()
+        targets_flat = targets.reshape(-1)
+        loss = F.cross_entropy(logits_cpu, targets_flat, reduction='mean')
 
         # dlogits = softmax(logits) - one_hot(targets)
         probs = F.softmax(logits_cpu, dim=-1)
         dlogits = probs.clone()
-        dlogits.scatter_(1, targets.squeeze(0).unsqueeze(1), dlogits.gather(1, targets.squeeze(0).unsqueeze(1)) - 1.0)
-        dlogits /= T  # mean reduction
+        dlogits.scatter_(1, targets_flat.unsqueeze(1),
+                         dlogits.gather(1, targets_flat.unsqueeze(1)) - 1.0)
+        dlogits /= BT  # mean reduction
 
         return loss.item(), saved_x, x0_cpu, dlogits
 
@@ -2545,6 +2555,8 @@ class TrainingState:
         """Full backward pass. Uses device kernels for dx flow, host for dW
         and attention backward."""
         T = self.T
+        B = self.B
+        BT = B * T
         C = self.config.n_embd
         H = self.config.mlp_hidden
         V = self.config.vocab_size
@@ -2556,13 +2568,13 @@ class TrainingState:
         grads = {}
 
         # --- Softcap + lm_head backward (host, operates on logits) ---
-        logits_pre_cpu = ttnn.to_torch(self.logits).reshape(T, -1)[:, :V].float()
+        logits_pre_cpu = ttnn.to_torch(self.logits).reshape(BT, -1)[:, :V].float()
         cap = self.config.softcap
         th = torch.tanh(logits_pre_cpu / cap)
         d_logits_pre = dlogits * (1.0 - th * th)
 
         lm_head_cpu = ttnn.to_torch(self.lm_head_tt).reshape(V, C).float()
-        final_normed_cpu = ttnn.to_torch(self.s1).reshape(T, C).float()
+        final_normed_cpu = ttnn.to_torch(self.s1).reshape(BT, C).float()
         d_final_normed = d_logits_pre @ lm_head_cpu
         grads['lm_head'] = d_logits_pre.t() @ final_normed_cpu
 
@@ -2573,9 +2585,9 @@ class TrainingState:
         d_fn_tt = to_ttnn(d_final_normed.to(torch.bfloat16), device)
         self.rmsnorm_bwd_c(x_final_tt, d_fn_tt, rstd_tt, self.scaler, self.ms_c, self.dx)
         # De-alias: dout_tt must not share storage with scratch tensors
-        dout_tt = to_ttnn(ttnn.to_torch(self.dx).reshape(T, C).to(torch.bfloat16), device)
+        dout_tt = to_ttnn(ttnn.to_torch(self.dx).reshape(BT, C).to(torch.bfloat16), device)
 
-        d_x0 = torch.zeros(T, C, dtype=torch.float32)
+        d_x0 = torch.zeros(BT, C, dtype=torch.float32)
 
         # --- Per-layer backward ---
         for i in reversed(range(self.config.n_layer)):
@@ -2588,7 +2600,7 @@ class TrainingState:
             scaled_residual_kernel(x_i_tt, x0_tt, self.lr_tiles[i],
                                    self.l0_tiles[i], self.s2)  # s2 = x_scaled
             self.rmsnorm_c(self.s2, self.scaler, self.ms_c, self.s1)  # s1 = normed
-            normed_cpu = ttnn.to_torch(self.s1).reshape(T, C).float()
+            normed_cpu = ttnn.to_torch(self.s1).reshape(BT, C).float()
 
             self.linear_cc(self.s1, self.w_q[i], self.q_flat)
             self.linear_cc(self.s1, self.w_k[i], self.k_flat)
@@ -2608,24 +2620,24 @@ class TrainingState:
                           self.attn_out, self.m_saved, self.l_saved)
 
             self.from_heads(self.attn_out, self.attn_concat)
-            attn_concat_cpu = ttnn.to_torch(self.attn_concat).reshape(T, C).float()
+            attn_concat_cpu = ttnn.to_torch(self.attn_concat).reshape(BT, C).float()
             self.linear_cc(self.attn_concat, self.w_proj[i], self.proj_out)
             residual_add_kernel(self.s2, self.proj_out, self.s3)  # s3 = x_post_attn
-            x_post_attn_cpu = ttnn.to_torch(self.s3).reshape(T, C).float()
+            x_post_attn_cpu = ttnn.to_torch(self.s3).reshape(BT, C).float()
 
             self.rmsnorm_c(self.s3, self.scaler, self.ms_c, self.s1)  # s1 = normed2
-            normed2_cpu = ttnn.to_torch(self.s1).reshape(T, C).float()
+            normed2_cpu = ttnn.to_torch(self.s1).reshape(BT, C).float()
             self.linear_ch(self.s1, self.w_fc[i], self.hidden)
             relu_sq_kernel(self.hidden, self.hidden_act)
-            hidden_pre_cpu = ttnn.to_torch(self.hidden).reshape(T, H).float()
-            hidden_act_cpu = ttnn.to_torch(self.hidden_act).reshape(T, H).float()
+            hidden_pre_cpu = ttnn.to_torch(self.hidden).reshape(BT, H).float()
+            hidden_act_cpu = ttnn.to_torch(self.hidden_act).reshape(BT, H).float()
             self.linear_hc(self.hidden_act, self.w_mlp_proj[i], self.mlp_out)
 
             # == Backward MLP (device kernels for dx, host for dW) ==
 
             # d_hidden_act = dout @ w_mlp_proj^T
             self.linear_cc(dout_tt, self.w_mlp_proj_t[i], self.d_hidden_act)
-            dout_cpu = ttnn.to_torch(dout_tt).reshape(T, C).float()
+            dout_cpu = ttnn.to_torch(dout_tt).reshape(BT, C).float()
             grads[f'layer.{i}.w_mlp_proj'] = hidden_act_cpu.t() @ dout_cpu
 
             # relu_sq backward on device
@@ -2633,7 +2645,7 @@ class TrainingState:
 
             # d_normed2 = d_hidden @ w_fc^T (k=96, use chunked kernel)
             self.linear_hc(self.d_hidden, self.w_fc_t[i], self.d_normed)
-            d_hidden_cpu = ttnn.to_torch(self.d_hidden).reshape(T, H).float()
+            d_hidden_cpu = ttnn.to_torch(self.d_hidden).reshape(BT, H).float()
             grads[f'layer.{i}.w_fc'] = normed2_cpu.t() @ d_hidden_cpu
 
             # rmsnorm backward on device
@@ -2648,7 +2660,7 @@ class TrainingState:
 
             # d_attn_concat = d_x_post_attn @ w_proj^T
             self.linear_cc(self.d_resid, self.w_proj_t[i], self.s1)
-            d_x_post_attn_cpu = ttnn.to_torch(self.d_resid).reshape(T, C).float()
+            d_x_post_attn_cpu = ttnn.to_torch(self.d_resid).reshape(BT, C).float()
             grads[f'layer.{i}.w_proj'] = attn_concat_cpu.t() @ d_x_post_attn_cpu
 
             # reshape to heads
@@ -2663,12 +2675,10 @@ class TrainingState:
                           self.d_q_heads, self.d_k_heads, self.d_v_heads)
 
             # QK norm backward on device (rmsnorm bwd on q_rot, k_rot)
-            # dQ_input already includes scale; multiply by qk_scale for norm bwd
             rstd_q_tt = self._make_rstd(
-                ttnn.to_torch(self.q_rot).reshape(n_head * T, hd).float(), hd)
+                ttnn.to_torch(self.q_rot).reshape(n_head * BT, hd).float(), hd)
             rstd_k_tt = self._make_rstd(
-                ttnn.to_torch(self.k_rot).reshape(n_head * T, hd).float(), hd)
-            # dQ_heads has scale baked in; rmsnorm_bwd expects dout, x, rstd
+                ttnn.to_torch(self.k_rot).reshape(n_head * BT, hd).float(), hd)
             self.rmsnorm_bwd_hd(self.q_rot, self.d_q_heads, rstd_q_tt,
                                 self.scaler, self.ms_hd, self.d_q_rot)
             self.rmsnorm_bwd_hd(self.k_rot, self.d_k_heads, rstd_k_tt,
@@ -2684,9 +2694,9 @@ class TrainingState:
             self.from_heads(self.d_v_heads, self.v_flat)
 
             # dW for QKV on host
-            dq_cpu = ttnn.to_torch(self.q_flat).reshape(T, C).float()
-            dk_cpu = ttnn.to_torch(self.k_flat).reshape(T, C).float()
-            dv_cpu = ttnn.to_torch(self.v_flat).reshape(T, C).float()
+            dq_cpu = ttnn.to_torch(self.q_flat).reshape(BT, C).float()
+            dk_cpu = ttnn.to_torch(self.k_flat).reshape(BT, C).float()
+            dv_cpu = ttnn.to_torch(self.v_flat).reshape(BT, C).float()
             grads[f'layer.{i}.w_q'] = normed_cpu.t() @ dq_cpu
             grads[f'layer.{i}.w_k'] = normed_cpu.t() @ dk_cpu
             grads[f'layer.{i}.w_v'] = normed_cpu.t() @ dv_cpu
@@ -2699,7 +2709,7 @@ class TrainingState:
             residual_add_kernel(self.s1, self.dx, self.d_normed)
 
             # Pre-attention rmsnorm backward (device)
-            x_scaled_cpu = ttnn.to_torch(self.s2).reshape(T, C).float()
+            x_scaled_cpu = ttnn.to_torch(self.s2).reshape(BT, C).float()
             rstd1_tt = self._make_rstd(x_scaled_cpu, C)
             self.rmsnorm_bwd_c(self.s2, self.d_normed, rstd1_tt,
                                self.scaler, self.ms_c, self.dx)
@@ -2708,20 +2718,21 @@ class TrainingState:
             residual_add_kernel(self.dx, self.d_resid, self.s1)
 
             # Scaled residual backward (host, scalar multiply)
-            d_x_scaled_cpu = ttnn.to_torch(self.s1).reshape(T, C).float()
+            d_x_scaled_cpu = ttnn.to_torch(self.s1).reshape(BT, C).float()
             dout_cpu = lr_val * d_x_scaled_cpu
             d_x0 += l0_val * d_x_scaled_cpu
             dout_tt = to_ttnn(dout_cpu.to(torch.bfloat16), device)
 
         # Embedding backward (host)
         grads['wte'] = torch.zeros_like(self.wte_cpu.float())
-        x_embed_cpu = self.wte_cpu[input_ids.squeeze(0)].float()
+        ids_flat = input_ids.reshape(-1)
+        x_embed_cpu = self.wte_cpu[ids_flat].float()
         d_total = dout_cpu + d_x0
         rstd_e = (x_embed_cpu.pow(2).mean(-1, keepdim=True) + 1e-5).rsqrt()
         ce = (d_total * x_embed_cpu).sum(-1, keepdim=True)
         d_embed = rstd_e * d_total - rstd_e.pow(3) * ce / C * x_embed_cpu
-        for t_idx in range(T):
-            tok = input_ids[0, t_idx].item()
+        for t_idx in range(BT):
+            tok = ids_flat[t_idx].item()
             grads['wte'][tok] += d_embed[t_idx]
 
         return grads
@@ -3027,10 +3038,10 @@ def test_full_forward(device):
     print("  PASS")
 
 
-def test_training(device, config=D1_CONFIG, T=128, n_steps=5, label="d1"):
+def test_training(device, config=D1_CONFIG, T=128, B=1, n_steps=5, label="d1"):
     """Test training: loss decreases over steps."""
     print("\n" + "=" * 60)
-    print(f"Testing training loop ({label}, T={T}, {n_steps} steps)")
+    print(f"Testing training loop ({label}, B={B}, T={T}, {n_steps} steps)")
     print("=" * 60)
     lr = 1e-3
     beta1, beta2, wd = 0.9, 0.999, 0.01
@@ -3041,10 +3052,10 @@ def test_training(device, config=D1_CONFIG, T=128, n_steps=5, label="d1"):
         layer['w_proj'] = torch.randn_like(layer['w_proj']) * 0.01
         layer['w_mlp_proj'] = torch.randn_like(layer['w_mlp_proj']) * 0.01
 
-    input_ids = torch.randint(0, config.vocab_size, (1, T))
-    targets = torch.randint(0, config.vocab_size, (1, T))
+    input_ids = torch.randint(0, config.vocab_size, (B, T))
+    targets = torch.randint(0, config.vocab_size, (B, T))
 
-    state = TrainingState(config, model, device, T=T)
+    state = TrainingState(config, model, device, T=T, B=B)
 
     losses = []
     for step in range(n_steps):
@@ -3191,6 +3202,6 @@ def test_backward_triage(device, config=D1_CONFIG, T=128):
 if __name__ == "__main__":
     device = ttnn.open_device(device_id=0)
     try:
-        test_training(device, config=D12_CONFIG, T=2048, n_steps=10, label="d12")
+        test_training(device, config=D12_CONFIG, T=2048, B=8, n_steps=10, label="d12")
     finally:
         ttnn.close_device(device)
